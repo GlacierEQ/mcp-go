@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"os/exec"
-	"runtime"
 	"testing"
 	"time"
 
@@ -13,26 +12,20 @@ import (
 
 // TestStdio_StartIdempotency tests that calling Start() multiple times is safe
 func TestStdio_StartIdempotency(t *testing.T) {
-	tempFile, err := os.CreateTemp("", "mockstdio_server")
+	tempFile, err := os.CreateTemp(t.TempDir(), "mockstdio_server")
 	if err != nil {
 		t.Fatalf("Failed to create temp file: %v", err)
 	}
 	tempFile.Close()
-	mockServerPath := tempFile.Name()
-
-	if runtime.GOOS == "windows" {
-		os.Remove(mockServerPath)
-		mockServerPath += ".exe"
-	}
+	mockServerPath := tempFile.Name() + ".exe"
 
 	if compileErr := compileTestServer(mockServerPath); compileErr != nil {
 		t.Fatalf("Failed to compile mock server: %v", compileErr)
 	}
-	defer os.Remove(mockServerPath)
 
 	stdio := NewStdio(mockServerPath, nil)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
 	// First Start() - should succeed
@@ -72,7 +65,7 @@ func TestStdio_StartFailureReset(t *testing.T) {
 	// First attempt with invalid command - should fail
 	stdio := NewStdio("nonexistent_command_xyz", nil)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	err := stdio.Start(ctx)
 	if err == nil {
 		t.Fatal("Expected Start() to fail with invalid command")
@@ -96,22 +89,16 @@ func TestStdio_StartFailureReset(t *testing.T) {
 
 // TestStdio_StartWithOptions_Idempotent tests idempotency with custom options
 func TestStdio_StartWithOptions_Idempotent(t *testing.T) {
-	tempFile, err := os.CreateTemp("", "mockstdio_server")
+	tempFile, err := os.CreateTemp(t.TempDir(), "mockstdio_server")
 	if err != nil {
 		t.Fatalf("Failed to create temp file: %v", err)
 	}
 	tempFile.Close()
-	mockServerPath := tempFile.Name()
-
-	if runtime.GOOS == "windows" {
-		os.Remove(mockServerPath)
-		mockServerPath += ".exe"
-	}
+	mockServerPath := tempFile.Name() + ".exe"
 
 	if compileErr := compileTestServer(mockServerPath); compileErr != nil {
 		t.Fatalf("Failed to compile mock server: %v", compileErr)
 	}
-	defer os.Remove(mockServerPath)
 
 	cmdFuncCallCount := 0
 	cmdFunc := func(ctx context.Context, command string, env []string, args []string) (*exec.Cmd, error) {
@@ -123,7 +110,7 @@ func TestStdio_StartWithOptions_Idempotent(t *testing.T) {
 
 	stdio := NewStdioWithOptions(mockServerPath, nil, nil, WithCommandFunc(cmdFunc))
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
 	// First Start()

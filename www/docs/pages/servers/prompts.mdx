@@ -23,6 +23,41 @@ prompt := mcp.NewPrompt("code_review",
 )
 ```
 
+### Prompt Icons
+
+Prompts can include visual identifiers:
+
+```go
+prompt := mcp.NewPrompt("code_review",
+    mcp.WithPromptDescription("Review code for best practices"),
+    mcp.WithPromptIcons(
+        mcp.Icon{
+            Src:      "https://example.com/icons/review.png",
+            MIMEType: "image/png",
+        },
+    ),
+    // ... arguments
+)
+```
+
+### Display Title
+
+Prompts and their arguments can carry a human-readable display title. Clients render the title in pickers and UI surfaces; the `name` stays a stable programmatic identifier.
+
+```go
+prompt := mcp.NewPrompt("code_review",
+    mcp.WithPromptTitle("Code Review"),                            // Shown in UI
+    mcp.WithPromptDescription("Review code for best practices"),
+    mcp.WithArgument("code",
+        mcp.ArgumentTitle("Source Code"),                          // Argument display name
+        mcp.ArgumentDescription("The code to review"),
+        mcp.RequiredArgument(),
+    ),
+)
+```
+
+When `Title` is empty, clients fall back to `Name`. Both fields serialise with `omitempty`, so existing prompts that don't set a title are unchanged on the wire.
+
 ## Prompt Templates
 
 ### Basic Code Review Prompt
@@ -555,6 +590,74 @@ func handleTemplatePrompt(ctx context.Context, req mcp.GetPromptRequest) (*mcp.G
         },
     }, nil
 }
+```
+
+## Prompt Filtering
+
+Filter which prompts are visible to each client based on context, session, or permissions — analogous to tool filtering via `WithToolFilter`.
+
+### Permission-Based Prompt Filtering
+
+```go
+s := server.NewMCPServer("Prompt Server", "1.0.0",
+    server.WithPromptCapabilities(true),
+    server.WithPromptFilter(func(ctx context.Context, prompts []mcp.Prompt) []mcp.Prompt {
+        session := server.ClientSessionFromContext(ctx)
+        if session == nil {
+            return nil
+        }
+
+        // Filter prompts based on session or context
+        var filtered []mcp.Prompt
+        for _, p := range prompts {
+            if shouldExposePrompt(ctx, p) {
+                filtered = append(filtered, p)
+            }
+        }
+        return filtered
+    }),
+)
+```
+
+Multiple filters can be added and they are applied in order:
+
+```go
+s := server.NewMCPServer("Server", "1.0.0",
+    server.WithPromptCapabilities(true),
+    server.WithPromptFilter(roleFilter),
+    server.WithPromptFilter(environmentFilter),
+)
+```
+
+## Prompt Handler Middleware
+
+Wrap prompt handlers with cross-cutting concerns like logging, caching, or authentication — analogous to `WithToolHandlerMiddleware`.
+
+```go
+s := server.NewMCPServer("Server", "1.0.0",
+    server.WithPromptCapabilities(true),
+    server.WithPromptHandlerMiddleware(func(next server.PromptHandlerFunc) server.PromptHandlerFunc {
+        return func(ctx context.Context, req mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+            start := time.Now()
+            log.Printf("Prompt requested: %s", req.Params.Name)
+
+            result, err := next(ctx, req)
+
+            log.Printf("Prompt %s served in %v", req.Params.Name, time.Since(start))
+            return result, err
+        }
+    }),
+)
+```
+
+Middlewares are composed in order — the first registered wraps the outermost layer:
+
+```go
+s := server.NewMCPServer("Server", "1.0.0",
+    server.WithPromptCapabilities(true),
+    server.WithPromptHandlerMiddleware(loggingMiddleware),
+    server.WithPromptHandlerMiddleware(authMiddleware),
+)
 ```
 
 ## Next Steps

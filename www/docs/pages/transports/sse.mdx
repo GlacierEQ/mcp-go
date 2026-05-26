@@ -289,12 +289,42 @@ sseServer := server.NewSSEServer(s,
         // Add custom context values from headers
         return ctx
     }),
+
+    // Enable Cross-Origin Resource Sharing for browser-based clients
+    server.WithSSECORS(
+        server.WithCORSAllowedOrigins("https://my-ai-app.com"),
+        server.WithCORSAllowCredentials(),
+    ),
 )
 ```
+
+CORS handling is opt-in. Without `WithSSECORS`, the SSE stream falls back to
+the historical default of `Access-Control-Allow-Origin: *` for backwards
+compatibility, while the message endpoint emits no CORS headers.
+See the [Streamable HTTP CORS docs](/transports/http#cross-origin-resource-sharing-cors)
+for the full list of `CORSOption` helpers shared between both transports.
 
 **Resulting endpoints:**
 - SSE stream: `http://localhost:8080/api/mcp/sse`
 - Message endpoint: `http://localhost:8080/api/mcp/message`
+
+### SSE Client Timeout Options
+
+When using the legacy SSE transport on the client side, you can configure endpoint and response timeouts:
+
+```go
+import "github.com/mark3labs/mcp-go/client/transport"
+
+sseTransport, err := transport.NewSSE("http://localhost:8080/sse",
+    // Max time to wait for the SSE endpoint URL during Start() (default: 30s)
+    transport.WithEndpointTimeout(60*time.Second),
+
+    // Max time to wait for a response after sending a request (default: 60s)
+    transport.WithResponseTimeout(120*time.Second),
+)
+```
+
+Zero or negative values are silently ignored to prevent misconfiguration. If the context passed to the operation has a shorter deadline, the shorter value takes precedence.
 
 ## Real-Time Notifications
 

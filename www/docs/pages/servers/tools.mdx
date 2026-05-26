@@ -24,6 +24,44 @@ tool := mcp.NewTool("calculate",
 
 ## Tool Definition
 
+### Display Title
+
+Tools can carry a human-readable display title separate from their programmatic `name`. Clients display titles in tool pickers and UI surfaces; the `name` is reserved for model-facing identifiers.
+
+```go
+tool := mcp.NewTool("calculate_arithmetic",
+    mcp.WithToolTitle("Calculator"),               // Shown in UI
+    mcp.WithDescription("Perform arithmetic operations"),
+    // ... parameters
+)
+```
+
+Per the [MCP spec](https://modelcontextprotocol.io/specification/2025-06-18/server/tools), clients should resolve the display label in this order:
+
+1. `Title` (the top-level field set by `WithToolTitle`)
+2. `Annotations.Title` (legacy hint set by `WithTitleAnnotation`, see [Tool Annotations](#tool-annotations))
+3. `Name`
+
+Both fields are optional; omitting them falls back to the next candidate.
+
+### Tool Icons
+
+Tools can include visual identifiers using icons. Icons must use HTTPS or data URIs:
+
+```go
+tool := mcp.NewTool("calculate",
+    mcp.WithDescription("Perform arithmetic operations"),
+    mcp.WithToolIcons(
+        mcp.Icon{
+            Src:      "https://example.com/icons/calculator.png",
+            MIMEType: "image/png",
+            Sizes:    []string{"32x32", "64x64"},
+        },
+    ),
+    // ... parameters
+)
+```
+
 ### Parameter Types
 
 MCP-Go supports various parameter types with validation:
@@ -41,21 +79,21 @@ mcp.WithString("name",
 mcp.WithNumber("age",
     mcp.Required(),
     mcp.Description("User's age"),
-    mcp.Minimum(0),
-    mcp.Maximum(150),
+    mcp.Min(0),
+    mcp.Max(150),
 )
 
 // Integer parameters
 mcp.WithInteger("count",
-    mcp.Default(10),
+    mcp.DefaultNumber(10),
     mcp.Description("Number of items"),
-    mcp.Minimum(1),
-    mcp.Maximum(1000),
+    mcp.Min(1),
+    mcp.Max(1000),
 )
 
 // Boolean parameters
 mcp.WithBoolean("enabled",
-    mcp.Default(true),
+    mcp.DefaultBool(true),
     mcp.Description("Whether feature is enabled"),
 )
 
@@ -95,8 +133,8 @@ mcp.WithString("email",
 // Number constraints
 mcp.WithNumber("price",
     mcp.Required(),
-    mcp.Minimum(0),
-    mcp.ExclusiveMaximum(10000),
+    mcp.Min(0),
+    mcp.Max(10000),
     mcp.Description("Product price in USD"),
 )
 ```
@@ -112,10 +150,10 @@ Define your input parameters as a Go struct and use `WithInputSchema`:
 ```go
 // Define input struct with JSON schema tags
 type SearchRequest struct {
-    Query      string   `json:"query" jsonschema_description:"Search query" jsonschema:"required"`
-    Limit      int      `json:"limit,omitempty" jsonschema_description:"Maximum results" jsonschema:"minimum=1,maximum=100,default=10"`
-    Categories []string `json:"categories,omitempty" jsonschema_description:"Filter by categories"`
-    SortBy     string   `json:"sortBy,omitempty" jsonschema_description:"Sort field" jsonschema:"enum=relevance,enum=date,enum=popularity"`
+    Query      string   `json:"query" jsonschema:"Search query"`
+    Limit      int      `json:"limit,omitempty" jsonschema:"Maximum results"`
+    Categories []string `json:"categories,omitempty" jsonschema:"Filter by categories"`
+    SortBy     string   `json:"sortBy,omitempty" jsonschema:"Sort field"`
 }
 
 // Create tool with struct-based input schema
@@ -132,17 +170,17 @@ Define structured output for predictable tool responses:
 ```go
 // Define output struct
 type SearchResponse struct {
-    Query       string    `json:"query" jsonschema_description:"Original search query"`
-    TotalCount  int       `json:"totalCount" jsonschema_description:"Total matching products"`
-    Products    []Product `json:"products" jsonschema_description:"Search results"`
-    ProcessedAt time.Time `json:"processedAt" jsonschema_description:"When search was performed"`
+    Query       string    `json:"query" jsonschema:"Original search query"`
+    TotalCount  int       `json:"totalCount" jsonschema:"Total matching products"`
+    Products    []Product `json:"products" jsonschema:"Search results"`
+    ProcessedAt time.Time `json:"processedAt" jsonschema:"When search was performed"`
 }
 
 type Product struct {
-    ID          string  `json:"id" jsonschema_description:"Product ID"`
-    Name        string  `json:"name" jsonschema_description:"Product name"`
-    Price       float64 `json:"price" jsonschema_description:"Price in USD"`
-    InStock     bool    `json:"inStock" jsonschema_description:"Availability"`
+    ID          string  `json:"id" jsonschema:"Product ID"`
+    Name        string  `json:"name" jsonschema:"Product name"`
+    Price       float64 `json:"price" jsonschema:"Price in USD"`
+    InStock     bool    `json:"inStock" jsonschema:"Availability"`
 }
 
 // Create tool with both input and output schemas
@@ -197,6 +235,27 @@ func searchProductsHandler(ctx context.Context, req mcp.CallToolRequest, args Se
 }
 ```
 
+### Validating Output Against the Schema
+
+Declaring an output schema is a contract: clients can rely on the shape of
+`structuredContent` matching the schema you advertised. To enforce that
+contract at runtime, opt in to output schema validation when constructing
+the server:
+
+```go
+s := server.NewMCPServer("Product Search", "1.0.0",
+    server.WithToolCapabilities(false),
+    server.WithOutputSchemaValidation(), // reject results that don't match outputSchema
+)
+```
+
+When enabled, every tool result whose `StructuredContent` does not conform
+to the declared `outputSchema` is replaced with a tool execution error
+(`IsError: true`). This catches handler bugs server-side instead of letting
+them reach the client as a silent protocol violation. Tools without an
+output schema, results without `StructuredContent`, and error results are
+all passed through unchanged.
+
 ### Array Output Schema
 
 Tools can return arrays of structured data:
@@ -204,17 +263,17 @@ Tools can return arrays of structured data:
 ```go
 // Define asset struct
 type Asset struct {
-    ID       string  `json:"id" jsonschema_description:"Asset identifier"`
-    Name     string  `json:"name" jsonschema_description:"Asset name"`
-    Value    float64 `json:"value" jsonschema_description:"Current value"`
-    Currency string  `json:"currency" jsonschema_description:"Currency code"`
+    ID       string  `json:"id" jsonschema:"Asset identifier"`
+    Name     string  `json:"name" jsonschema:"Asset name"`
+    Value    float64 `json:"value" jsonschema:"Current value"`
+    Currency string  `json:"currency" jsonschema:"Currency code"`
 }
 
 // Tool that returns array of assets
 assetsTool := mcp.NewTool("list_assets",
     mcp.WithDescription("List portfolio assets"),
     mcp.WithInputSchema[struct {
-        Portfolio string `json:"portfolio" jsonschema_description:"Portfolio ID" jsonschema:"required"`
+        Portfolio string `json:"portfolio" jsonschema:"Portfolio ID"`
     }](),
     mcp.WithOutputSchema[[]Asset](), // Array output schema
 )
@@ -228,31 +287,97 @@ func listAssetsHandler(ctx context.Context, req mcp.CallToolRequest, args struct
 }
 ```
 
+### Caching Schemas for Stateless / Serverless Deployments
+
+Generating JSON schemas with `WithInputSchema[T]()` and `WithOutputSchema[T]()`
+uses reflection at server start-up. In long-running servers this is a one-time
+cost, but in serverless environments (AWS Lambda, Cloud Functions, Cloud Run
+with scale-to-zero) the server is reconstructed on every cold start and the
+reflection cost is paid again and again.
+
+Use `mcp.SchemaCache` to pre-compute schemas at build time, persist them to
+disk, and reload them at start-up:
+
+```go
+// build/warm-cache.go — run as part of your build pipeline
+func main() {
+    cache := mcp.NewSchemaCache()
+    if err := mcp.WarmFor[WeatherRequest](cache); err != nil {
+        log.Fatal(err)
+    }
+    if err := mcp.WarmFor[WeatherResponse](cache); err != nil {
+        log.Fatal(err)
+    }
+    if err := cache.Save("schemas.json"); err != nil {
+        log.Fatal(err)
+    }
+}
+```
+
+At runtime, load the cache once and pass it to the cache-aware tool options.
+On a cache hit the schema is served straight from memory; on a miss the cache
+falls back to reflection and stores the result for next time, so the same
+code works locally without a pre-built cache file:
+
+```go
+var cache = func() *mcp.SchemaCache {
+    c, err := mcp.LoadSchemaCache("schemas.json")
+    if err != nil {
+        return mcp.NewSchemaCache() // fall back to live reflection
+    }
+    return c
+}()
+
+weatherTool := mcp.NewTool("get_weather",
+    mcp.WithDescription("Get current weather"),
+    mcp.WithCachedInputSchema[WeatherRequest](cache),
+    mcp.WithCachedOutputSchema[WeatherResponse](cache),
+)
+```
+
+The cache key defaults to the package-qualified Go type name
+(e.g. `main.WeatherRequest`). If you need a stable key that survives renames
+or package moves, use the explicit-key variants:
+
+```go
+if err := mcp.WarmFor[WeatherRequest](cache, "weather.v1.input"); err != nil {
+    log.Fatal(err)
+}
+
+mcp.WithCachedInputSchemaKey[WeatherRequest](cache, "weather.v1.input")
+```
+
+`SchemaCache` is safe for concurrent use, marshals to deterministic JSON
+(sorted keys), and writes via an atomic temp-file-and-rename in `Save`.
+
 ### Schema Tags Reference
 
-MCP-Go uses the `jsonschema` struct tags for schema generation:
+MCP-Go uses the [`google/jsonschema-go`](https://github.com/google/jsonschema-go) library with the `jsonschema` struct tag for schema generation:
 
 ```go
 type ExampleStruct struct {
-    // Required field
-    Name string `json:"name" jsonschema:"required"`
-    
+    // Required field (no omitempty in json tag means required)
+    Name string `json:"name" jsonschema:"User's full name"`
+
     // Field with description
-    Age int `json:"age" jsonschema_description:"User age in years"`
-    
-    // Field with constraints
-    Score float64 `json:"score" jsonschema:"minimum=0,maximum=100"`
-    
-    // Enum field
-    Status string `json:"status" jsonschema:"enum=active,enum=inactive,enum=pending"`
-    
-    // Optional field with default
-    PageSize int `json:"pageSize,omitempty" jsonschema:"default=20"`
-    
-    // Array with constraints
-    Tags []string `json:"tags" jsonschema:"minItems=1,maxItems=10"`
+    Age int `json:"age" jsonschema:"User age in years"`
+
+    // Optional field (omitempty makes it optional)
+    PageSize int `json:"pageSize,omitempty" jsonschema:"Number of items per page"`
+
+    // Optional field with description
+    Status string `json:"status,omitempty" jsonschema:"Current status"`
 }
 ```
+
+:::info Migration Note
+MCP-Go migrated from `invopop/jsonschema` to `google/jsonschema-go`. If you are upgrading from an older version, note these breaking changes:
+
+- **Description tag**: Changed from `jsonschema_description:"text"` to `jsonschema:"text"`
+- **Required fields**: The `jsonschema:"required"` tag is no longer supported. Fields without `omitempty` in their `json` tag are automatically required.
+- **Validation constraints**: Tags like `jsonschema:"enum=..."`, `jsonschema:"minimum=..."` are no longer supported in struct tags. Use `mcp.WithRawInputSchema()` for these constraints or define them with the builder API (`mcp.WithString`, `mcp.WithNumber`, etc.).
+- **Additional properties**: `additionalProperties: false` is now automatically included in generated schemas.
+:::
 
 ### Manual Structured Results
 
@@ -290,19 +415,19 @@ Here's a complete example using the file operations pattern from earlier, enhanc
 ```go
 // Define structured input for file operations
 type FileOperationRequest struct {
-    Path     string `json:"path" jsonschema_description:"File path" jsonschema:"required"`
-    Content  string `json:"content,omitempty" jsonschema_description:"File content (for write operations)"`
-    Encoding string `json:"encoding,omitempty" jsonschema_description:"File encoding" jsonschema:"enum=utf-8,enum=ascii,enum=base64,default=utf-8"`
+    Path     string `json:"path" jsonschema:"File path"`
+    Content  string `json:"content,omitempty" jsonschema:"File content (for write operations)"`
+    Encoding string `json:"encoding,omitempty" jsonschema:"File encoding"`
 }
 
 // Define structured output
 type FileOperationResponse struct {
-    Success   bool      `json:"success" jsonschema_description:"Operation success status"`
-    Path      string    `json:"path" jsonschema_description:"File path"`
-    Message   string    `json:"message" jsonschema_description:"Result message"`
-    Content   string    `json:"content,omitempty" jsonschema_description:"File content (for read operations)"`
-    Size      int64     `json:"size,omitempty" jsonschema_description:"File size in bytes"`
-    Modified  time.Time `json:"modified,omitempty" jsonschema_description:"Last modified time"`
+    Success   bool      `json:"success" jsonschema:"Operation success status"`
+    Path      string    `json:"path" jsonschema:"File path"`
+    Message   string    `json:"message" jsonschema:"Result message"`
+    Content   string    `json:"content,omitempty" jsonschema:"File content (for read operations)"`
+    Size      int64     `json:"size,omitempty" jsonschema:"File size in bytes"`
+    Modified  time.Time `json:"modified,omitempty" jsonschema:"Last modified time"`
 }
 
 func main() {
@@ -321,7 +446,7 @@ func main() {
     readFileTool := mcp.NewTool("read_file",
         mcp.WithDescription("Read file contents"),
         mcp.WithInputSchema[struct {
-            Path string `json:"path" jsonschema_description:"File path to read" jsonschema:"required"`
+            Path string `json:"path" jsonschema:"File path to read"`
         }](),
         mcp.WithOutputSchema[FileOperationResponse](),
     )
@@ -505,7 +630,7 @@ func main() {
             mcp.Description("File content"),
         ),
         mcp.WithString("encoding",
-            mcp.Default("utf-8"),
+            mcp.DefaultString("utf-8"),
             mcp.Enum("utf-8", "ascii", "base64"),
             mcp.Description("File encoding"),
         ),
@@ -911,7 +1036,8 @@ func handleGetAnnotatedResourceTool(ctx context.Context, req mcp.CallToolRequest
 	// Create resource link with annotations
 	annotated := mcp.Annotated{
 		Annotations: &mcp.Annotations{
-			Audience: []mcp.Role{mcp.RoleUser},
+			Audience:     []mcp.Role{mcp.RoleUser},
+			LastModified: "2025-01-12T15:00:58Z",
 		},
 	}
 	url := "file://documents/test.pdf"
@@ -972,8 +1098,8 @@ tool := mcp.NewTool("search_database",
     ),
     mcp.WithNumber("limit",
         mcp.DefaultNumber(10),
-        mcp.Minimum(1),
-        mcp.Maximum(100),
+        mcp.Min(1),
+        mcp.Max(100),
         mcp.Description("Maximum number of results to return"),
     ),
     mcp.WithArray("categories",
@@ -1046,6 +1172,98 @@ func addConditionalTools(s *server.MCPServer, userRole string) {
     s.AddTool(userTool, handleGetProfile)
 }
 ```
+
+### Session-specific Tools
+
+You can add tools to a specific client session, allowing different clients to have access to different tools or different implementations of the same tool.
+
+#### Using Helper Functions (Recommended)
+
+The server provides convenient helper functions for managing session tools:
+
+```go
+// Add a single session tool
+userTool := mcp.NewTool(
+    "get_user_data",
+    mcp.WithDescription("Get current user's data"),
+)
+
+err := s.AddSessionTool(
+    sessionID,
+    userTool,
+    func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+        // This handler is only available to this specific session
+        return mcp.NewToolResultText("User data for " + sessionID), nil
+    },
+)
+if err != nil {
+    log.Printf("Failed to add session tool: %v", err)
+}
+
+// Add multiple session tools at once
+err = s.AddSessionTools(
+    sessionID,
+    server.ServerTool{
+        Tool: mcp.NewTool("user_settings", mcp.WithDescription("Manage user settings")),
+        Handler: func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+            return handleUserSettings(sessionID, req)
+        },
+    },
+    server.ServerTool{
+        Tool: mcp.NewTool("user_history", mcp.WithDescription("Access user history")),
+        Handler: func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+            return handleUserHistory(sessionID, req)
+        },
+    },
+)
+if err != nil {
+    log.Printf("Failed to add session tools: %v", err)
+}
+
+// Delete session tools when no longer needed
+err = s.DeleteSessionTools(sessionID, "get_user_data", "user_settings")
+if err != nil {
+    log.Printf("Failed to delete session tools: %v", err)
+}
+```
+
+#### Direct Interface Usage
+
+You can also work directly with the `SessionWithTools` interface:
+
+```go
+sseServer := server.NewSSEServer(
+    s,
+    server.WithAppendQueryToMessageEndpoint(),
+    server.WithSSEContextFunc(func(ctx context.Context, r *http.Request) context.Context {
+        withNewTools := r.URL.Query().Get("withNewTools")
+        if withNewTools != "1" {
+            return ctx
+        }
+
+        session := server.ClientSessionFromContext(ctx)
+        if sessionWithTools, ok := session.(server.SessionWithTools); ok {
+            // Add the new tools
+            sessionWithTools.SetSessionTools(map[string]server.ServerTool{
+                myNewTool.Name: {
+                    Tool:    myNewTool,
+                    Handler: NewToolHandler(myNewToolHandler),
+                },
+            })
+        }
+
+        return ctx
+    }),
+)
+```
+
+#### Important Notes
+
+- Session tools override global tools with the same name
+- Notifications (`tools/list_changed`) are automatically sent when tools are added/removed
+- The server automatically registers tool capabilities when session tools are first added
+- Operations are thread-safe and can be called concurrently
+- Tools are only available to initialized sessions unless explicitly added before initialization
 
 ## Next Steps
 

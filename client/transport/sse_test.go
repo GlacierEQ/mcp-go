@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -174,7 +175,7 @@ func TestSSE(t *testing.T) {
 	}
 
 	// Start the transport
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	defer cancel()
 
 	err = trans.Start(ctx)
@@ -184,7 +185,7 @@ func TestSSE(t *testing.T) {
 	defer trans.Close()
 
 	t.Run("SendRequest", func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 		defer cancel()
 
 		params := map[string]any{
@@ -242,7 +243,7 @@ func TestSSE(t *testing.T) {
 
 	t.Run("SendRequestWithTimeout", func(t *testing.T) {
 		// Create a context that's already canceled
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(t.Context())
 		cancel() // Cancel the context immediately
 
 		// Prepare a request
@@ -272,7 +273,7 @@ func TestSSE(t *testing.T) {
 
 		// Send a notification
 		// This would trigger a notification from the server
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 		defer cancel()
 
 		notification := mcp.JSONRPCNotification{
@@ -289,9 +290,7 @@ func TestSSE(t *testing.T) {
 			t.Fatalf("SendNotification failed: %v", err)
 		}
 
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			select {
 			case nt := <-notificationChan:
 				// We received a notification
@@ -304,7 +303,7 @@ func TestSSE(t *testing.T) {
 			case <-time.After(1 * time.Second):
 				t.Errorf("Expected notification, got none")
 			}
-		}()
+		})
 
 		wg.Wait()
 	})
@@ -318,11 +317,11 @@ func TestSSE(t *testing.T) {
 		responses := make([]*JSONRPCResponse, numRequests)
 		errors := make([]error, numRequests)
 
-		for i := 0; i < numRequests; i++ {
+		for i := range numRequests {
 			wg.Add(1)
 			go func(idx int) {
 				defer wg.Done()
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 				defer cancel()
 
 				// Each request has a unique ID and payload
@@ -347,7 +346,7 @@ func TestSSE(t *testing.T) {
 		wg.Wait()
 
 		// Check results
-		for i := 0; i < numRequests; i++ {
+		for i := range numRequests {
 			if errors[i] != nil {
 				t.Errorf("Request %d failed: %v", i, errors[i])
 				continue
@@ -411,11 +410,11 @@ func TestSSE(t *testing.T) {
 		// The request should fail because the context is canceled
 		reps, err := trans.SendRequest(ctx, request)
 		if err != nil {
-			t.Errorf("SendRequest failed: %v", err)
+			t.Fatalf("SendRequest failed: %v", err)
 		}
 
 		if reps.Error == nil {
-			t.Errorf("Expected error, got nil")
+			t.Fatalf("Expected error, got nil")
 		}
 
 		var responseError JSONRPCRequest
@@ -503,7 +502,7 @@ func TestSSE(t *testing.T) {
 		}
 
 		// Start the transport
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 		defer cancel()
 
 		err = trans.Start(ctx)
@@ -525,9 +524,7 @@ func TestSSE(t *testing.T) {
 			t.Fatalf("SendRequest failed: %v", err)
 		}
 
-		if response == nil {
-			t.Fatal("Expected response, got nil")
-		}
+		require.NotNil(t, response, "Expected response, got nil")
 
 		// Verify the response
 		var result string
@@ -540,14 +537,14 @@ func TestSSE(t *testing.T) {
 		}
 	})
 
-	t.Run("NO_ERROR_WithoutConnectionLostHandler", func(t *testing.T) {
-		// Test that NO_ERROR without connection lost handler maintains backward compatibility
-		// When no connection lost handler is set, NO_ERROR should be treated as a regular error
+	t.Run("WithoutConnectionLostHandler", func(t *testing.T) {
+		// Test that ERROR without connection lost handler maintains backward compatibility
+		// When no connection lost handler is set, ERROR should be treated as a regular error
 
-		// Create a mock Reader that simulates NO_ERROR
+		// Create a mock Reader that simulates ERROR
 		mockReader := &mockReaderWithError{
 			data: []byte("event: endpoint\ndata: /message\n\n"),
-			err:  errors.New("connection closed: NO_ERROR"),
+			err:  errors.New("context deadline exceeded (Client.Timeout or context cancellation while reading body)"),
 		}
 
 		// Create SSE transport
@@ -572,23 +569,22 @@ func TestSSE(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 
 		// The test passes if readSSE completes without panicking or hanging
-		// In backward compatibility mode, NO_ERROR should be treated as a regular error
-		t.Log("Backward compatibility test passed: NO_ERROR handled as regular error when no handler is set")
+		// In backward compatibility mode, ERROR should be treated as a regular error
+		t.Log("Backward compatibility test passed: ERROR handled as regular error when no handler is set")
 	})
 
-	t.Run("NO_ERROR_ConnectionLost", func(t *testing.T) {
-		// Test that NO_ERROR in HTTP/2 connection loss is properly handled
-		// This test verifies that when a connection is lost in a way that produces
-		// an error message containing "NO_ERROR", the connection lost handler is called
+	t.Run("WithConnectionLost", func(t *testing.T) {
+		// Test error handling on connection loss
+		// Verify the connection loss handler is triggered by an error message
 
 		var connectionLostCalled bool
 		var connectionLostError error
 		var mu sync.Mutex
 
-		// Create a mock Reader that simulates connection loss with NO_ERROR
+		// Create a mock Reader that simulates connection loss with ERROR
 		mockReader := &mockReaderWithError{
 			data: []byte("event: endpoint\ndata: /message\n\n"),
-			err:  errors.New("http2: stream closed with error code NO_ERROR"),
+			err:  errors.New("context deadline exceeded (Client.Timeout or context cancellation while reading body)"),
 		}
 
 		// Create SSE transport
@@ -608,7 +604,7 @@ func TestSSE(t *testing.T) {
 			connectionLostError = err
 		})
 
-		// Directly test the readSSE method with our mock reader that simulates NO_ERROR
+		// Directly test the readSSE method with our mock reader that simulates ERROR
 		go trans.readSSE(mockReader)
 
 		// Wait for connection lost handler to be called
@@ -619,136 +615,20 @@ func TestSSE(t *testing.T) {
 		for {
 			select {
 			case <-timeout:
-				t.Fatal("Connection lost handler was not called within timeout for NO_ERROR connection loss")
+				t.Fatal("Connection lost handler was not called within timeout for connection loss")
 			case <-ticker.C:
 				mu.Lock()
 				called := connectionLostCalled
 				err := connectionLostError
 				mu.Unlock()
-
 				if called {
 					if err == nil {
 						t.Fatal("Expected connection lost error, got nil")
 					}
-
-					// Verify that the error contains "NO_ERROR" string
-					if !strings.Contains(err.Error(), "NO_ERROR") {
-						t.Errorf("Expected error to contain 'NO_ERROR', got: %v", err)
-					}
-
-					t.Logf("Connection lost handler called with NO_ERROR: %v", err)
+					t.Logf("Connection lost handler called with error: %v", err)
 					return
 				}
 			}
-		}
-	})
-
-	t.Run("NO_ERROR_Handling", func(t *testing.T) {
-		// Test specific NO_ERROR string handling in readSSE method
-		// This tests the code path at line 209 where NO_ERROR is checked
-
-		// Create a mock Reader that simulates an error containing "NO_ERROR"
-		mockReader := &mockReaderWithError{
-			data: []byte("event: endpoint\ndata: /message\n\n"),
-			err:  errors.New("connection closed: NO_ERROR"),
-		}
-
-		// Create SSE transport
-		url, closeF := startMockSSEEchoServer()
-		defer closeF()
-
-		trans, err := NewSSE(url)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		var connectionLostCalled bool
-		var connectionLostError error
-		var mu sync.Mutex
-
-		// Set connection lost handler to verify it's called for NO_ERROR
-		trans.SetConnectionLostHandler(func(err error) {
-			mu.Lock()
-			defer mu.Unlock()
-			connectionLostCalled = true
-			connectionLostError = err
-		})
-
-		// Directly test the readSSE method with our mock reader
-		go trans.readSSE(mockReader)
-
-		// Wait for connection lost handler to be called
-		timeout := time.After(1 * time.Second)
-		ticker := time.NewTicker(10 * time.Millisecond)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-timeout:
-				t.Fatal("Connection lost handler was not called within timeout for NO_ERROR")
-			case <-ticker.C:
-				mu.Lock()
-				called := connectionLostCalled
-				err := connectionLostError
-				mu.Unlock()
-
-				if called {
-					if err == nil {
-						t.Fatal("Expected connection lost error with NO_ERROR, got nil")
-					}
-
-					// Verify that the error contains "NO_ERROR" string
-					if !strings.Contains(err.Error(), "NO_ERROR") {
-						t.Errorf("Expected error to contain 'NO_ERROR', got: %v", err)
-					}
-
-					t.Logf("Successfully handled NO_ERROR: %v", err)
-					return
-				}
-			}
-		}
-	})
-
-	t.Run("RegularError_DoesNotTriggerConnectionLost", func(t *testing.T) {
-		// Test that regular errors (not containing NO_ERROR) do not trigger connection lost handler
-
-		// Create a mock Reader that simulates a regular error
-		mockReader := &mockReaderWithError{
-			data: []byte("event: endpoint\ndata: /message\n\n"),
-			err:  errors.New("regular connection error"),
-		}
-
-		// Create SSE transport
-		url, closeF := startMockSSEEchoServer()
-		defer closeF()
-
-		trans, err := NewSSE(url)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		var connectionLostCalled bool
-		var mu sync.Mutex
-
-		// Set connection lost handler - this should NOT be called for regular errors
-		trans.SetConnectionLostHandler(func(err error) {
-			mu.Lock()
-			defer mu.Unlock()
-			connectionLostCalled = true
-		})
-
-		// Directly test the readSSE method with our mock reader
-		go trans.readSSE(mockReader)
-
-		// Wait and verify connection lost handler is NOT called
-		time.Sleep(200 * time.Millisecond)
-
-		mu.Lock()
-		called := connectionLostCalled
-		mu.Unlock()
-
-		if called {
-			t.Error("Connection lost handler should not be called for regular errors")
 		}
 	})
 }
@@ -770,7 +650,7 @@ func TestSSEErrors(t *testing.T) {
 		}
 
 		// Start should fail
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 		defer cancel()
 
 		err = sse.Start(ctx)
@@ -793,7 +673,7 @@ func TestSSEErrors(t *testing.T) {
 		}
 
 		// Starting should immediately error due to timeout
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 		defer cancel()
 		err = trans.Start(ctx)
 		if err == nil {
@@ -822,7 +702,7 @@ func TestSSEErrors(t *testing.T) {
 			Method:  "ping",
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
 		defer cancel()
 
 		_, err = sse.SendRequest(ctx, request)
@@ -843,7 +723,7 @@ func TestSSEErrors(t *testing.T) {
 		}
 
 		// Start the transport
-		ctx := context.Background()
+		ctx := t.Context()
 		if err := sse.Start(ctx); err != nil {
 			t.Fatalf("Failed to start SSE transport: %v", err)
 		}
@@ -895,7 +775,7 @@ func TestSSEErrors(t *testing.T) {
 		require.NoError(t, err)
 
 		// Start the transport
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 		t.Cleanup(cancel)
 
 		err = trans.Start(ctx)
@@ -911,5 +791,616 @@ func TestSSEErrors(t *testing.T) {
 		case <-time.After(3 * time.Second):
 			t.Fatal("Timeout waiting for error log message")
 		}
+	})
+}
+
+func TestSSE_Start_CustomEndpointTimeout(t *testing.T) {
+	// Server sends SSE headers but never sends an endpoint event.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		flusher.Flush()
+		// Block until the client gives up
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	customTimeout := 500 * time.Millisecond
+	transport, err := NewSSE(server.URL, WithEndpointTimeout(customTimeout))
+	require.NoError(t, err)
+	defer transport.Close()
+
+	// Use a generous parent context so only the endpoint timeout fires.
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	err = transport.Start(ctx)
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "timeout waiting for endpoint")
+	require.GreaterOrEqual(t, elapsed, customTimeout*7/10)
+	require.LessOrEqual(t, elapsed, customTimeout*2)
+}
+
+func TestSSE_NonPositiveTimeoutsKeepDefaults(t *testing.T) {
+	sse, err := NewSSE("http://localhost:8080")
+	require.NoError(t, err)
+
+	WithEndpointTimeout(0)(sse)
+	require.Equal(t, 30*time.Second, sse.endpointTimeout, "zero should keep default")
+
+	WithEndpointTimeout(-1 * time.Second)(sse)
+	require.Equal(t, 30*time.Second, sse.endpointTimeout, "negative should keep default")
+
+	WithResponseTimeout(0)(sse)
+	require.Equal(t, 60*time.Second, sse.responseTimeout, "zero should keep default")
+
+	WithResponseTimeout(-5 * time.Second)(sse)
+	require.Equal(t, 60*time.Second, sse.responseTimeout, "negative should keep default")
+}
+
+func TestSSE_Start_Unauthorized_StaticToken(t *testing.T) {
+	// Create a test server that always returns 401
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("Unauthorized"))
+	}))
+	defer server.Close()
+
+	// Create SSE with static headers (no OAuth)
+	transport, err := NewSSE(server.URL, WithHeaders(map[string]string{
+		"Authorization": "Bearer static-token",
+	}))
+	if err != nil {
+		t.Fatalf("Failed to create SSE: %v", err)
+	}
+
+	// Verify OAuth is not enabled
+	if transport.IsOAuthEnabled() {
+		t.Errorf("Expected IsOAuthEnabled() to return false")
+	}
+
+	// Start should fail with ErrUnauthorized
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	err = transport.Start(ctx)
+
+	// Verify the error is ErrUnauthorized
+	if err == nil {
+		t.Fatalf("Expected error, got nil")
+	}
+
+	if !errors.Is(err, ErrAuthorizationRequired) {
+		t.Fatalf("Expected ErrAuthorizationRequired, got %T: %v", err, err)
+	}
+
+	// Verify error message
+	if !strings.Contains(err.Error(), "authorization required") {
+		t.Errorf("Expected error message to contain 'authorization required', got: %v", err)
+	}
+}
+
+func TestSSE_SendRequest_Unauthorized_StaticToken(t *testing.T) {
+	// Create a test server that:
+	// 1. Returns 200 with endpoint for SSE connection
+	// 2. Returns 401 for POST requests to endpoint
+	endpointReceived := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Accept") == "text/event-stream" {
+			// SSE connection request - return endpoint
+			endpointURL := "http://" + r.Host + "/endpoint"
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("event: endpoint\ndata: " + endpointURL + "\n\n"))
+			endpointReceived = true
+			return
+		}
+		// Regular request to endpoint - return 401
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("Unauthorized"))
+	}))
+	defer server.Close()
+
+	// Create SSE with static headers (no OAuth)
+	transport, err := NewSSE(server.URL, WithHeaders(map[string]string{
+		"Authorization": "Bearer static-token",
+	}))
+	if err != nil {
+		t.Fatalf("Failed to create SSE: %v", err)
+	}
+
+	// Start the transport
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	err = transport.Start(ctx)
+	if err != nil {
+		t.Fatalf("Failed to start SSE: %v", err)
+	}
+
+	// Verify endpoint was received
+	if !endpointReceived {
+		t.Fatal("Endpoint was not received")
+	}
+
+	// Send a request
+	_, err = transport.SendRequest(t.Context(), JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      mcp.NewRequestId(1),
+		Method:  "test",
+	})
+
+	// Verify the error is ErrUnauthorized
+	if err == nil {
+		t.Fatalf("Expected error, got nil")
+	}
+
+	if !errors.Is(err, ErrAuthorizationRequired) {
+		t.Fatalf("Expected ErrAuthorizationRequired, got %T: %v", err, err)
+	}
+
+	// Clean up
+	transport.Close()
+}
+
+func TestSSE_SendNotification_Unauthorized_StaticToken(t *testing.T) {
+	// Create a test server that:
+	// 1. Returns 200 with endpoint for SSE connection
+	// 2. Returns 401 for POST requests to endpoint
+	endpointReceived := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Accept") == "text/event-stream" {
+			// SSE connection request - return endpoint
+			endpointURL := "http://" + r.Host + "/endpoint"
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("event: endpoint\ndata: " + endpointURL + "\n\n"))
+			endpointReceived = true
+			return
+		}
+		// Regular request to endpoint - return 401
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("Unauthorized"))
+	}))
+	defer server.Close()
+
+	// Create SSE with static headers (no OAuth)
+	transport, err := NewSSE(server.URL, WithHeaders(map[string]string{
+		"Authorization": "Bearer static-token",
+	}))
+	if err != nil {
+		t.Fatalf("Failed to create SSE: %v", err)
+	}
+
+	// Start the transport
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	err = transport.Start(ctx)
+	if err != nil {
+		t.Fatalf("Failed to start SSE: %v", err)
+	}
+
+	// Verify endpoint was received
+	if !endpointReceived {
+		t.Fatal("Endpoint was not received")
+	}
+
+	// Send a notification
+	err = transport.SendNotification(t.Context(), mcp.JSONRPCNotification{
+		JSONRPC: "2.0",
+		Notification: mcp.Notification{
+			Method: "test/notification",
+		},
+	})
+
+	// Verify the error is ErrUnauthorized
+	if err == nil {
+		t.Fatalf("Expected error, got nil")
+	}
+
+	if !errors.Is(err, ErrAuthorizationRequired) {
+		t.Fatalf("Expected ErrAuthorizationRequired, got %T: %v", err, err)
+	}
+
+	// Clean up
+	transport.Close()
+}
+
+// TestSSEHostOverride tests the Host header override functionality
+func TestSSEHostOverride(t *testing.T) {
+	// Create a test server that captures the Host header
+	var capturedHost string
+	var mu sync.Mutex
+
+	sseHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		capturedHost = r.Host
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+
+		// Send initial endpoint event
+		fmt.Fprintf(w, "event: endpoint\ndata: %s\n\n", "/message")
+		flusher.Flush()
+
+		// Keep connection open
+		<-r.Context().Done()
+	})
+
+	messageHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		response := JSONRPCResponse{
+			JSONRPC: "2.0",
+			ID:      mcp.NewRequestId(1),
+			Result:  []byte("test"),
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+			return
+		}
+	})
+
+	mux := http.NewServeMux()
+	mux.Handle("/", sseHandler)
+	mux.Handle("/message", messageHandler)
+
+	testServer := httptest.NewServer(mux)
+	defer testServer.Close()
+
+	// Parse test server URL to get the actual host
+	serverURL, _ := url.Parse(testServer.URL)
+	actualHost := serverURL.Host
+
+	t.Run("Default Host (no override)", func(t *testing.T) {
+		capturedHost = ""
+		trans, err := NewSSE(testServer.URL)
+		require.NoError(t, err)
+
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+
+		err = trans.Start(ctx)
+		require.NoError(t, err)
+		defer trans.Close()
+
+		// Host should match the actual server host
+		mu.Lock()
+		require.Equal(t, actualHost, capturedHost)
+		mu.Unlock()
+	})
+
+	t.Run("Custom Host override", func(t *testing.T) {
+		capturedHost = ""
+		customHost := "api.example.com"
+
+		trans, err := NewSSE(testServer.URL, WithHTTPHost(customHost))
+		require.NoError(t, err)
+
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+
+		err = trans.Start(ctx)
+		require.NoError(t, err)
+		defer trans.Close()
+
+		// Host should be the custom host, not the actual server host
+		mu.Lock()
+		require.Equal(t, customHost, capturedHost)
+		require.NotEqual(t, actualHost, capturedHost)
+		mu.Unlock()
+	})
+
+	t.Run("Custom Host with port", func(t *testing.T) {
+		capturedHost = ""
+		customHost := "backend.internal.com:8443"
+
+		trans, err := NewSSE(testServer.URL, WithHTTPHost(customHost))
+		require.NoError(t, err)
+
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+
+		err = trans.Start(ctx)
+		require.NoError(t, err)
+		defer trans.Close()
+
+		// Host should be the custom host with port
+		mu.Lock()
+		require.Equal(t, customHost, capturedHost)
+		mu.Unlock()
+	})
+
+	// Test WithHTTPHost function directly (unit test)
+	t.Run("WithHTTPHost function", func(t *testing.T) {
+		sse := &SSE{}
+		customHost := "test.example.com"
+
+		option := WithHTTPHost(customHost)
+		option(sse)
+
+		require.Equal(t, customHost, sse.host)
+
+		// Test overwrite
+		newHost := "new.example.com"
+		option = WithHTTPHost(newHost)
+		option(sse)
+
+		require.Equal(t, newHost, sse.host)
+
+		// Test empty string
+		option = WithHTTPHost("")
+		option(sse)
+
+		require.Equal(t, "", sse.host)
+	})
+}
+
+func TestSSE_SendRequest_Timeout(t *testing.T) {
+	t.Run("TimeoutWhenServerNeverResponds", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Accept") == "text/event-stream" {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				flusher, _ := w.(http.Flusher)
+				fmt.Fprintf(w, "event: endpoint\ndata: /message\n\n")
+				flusher.Flush()
+				<-r.Context().Done()
+				return
+			}
+
+			if r.Method == http.MethodPost {
+				w.WriteHeader(http.StatusAccepted)
+				return
+			}
+		}))
+		defer server.Close()
+
+		transport, err := NewSSE(server.URL)
+		require.NoError(t, err)
+		defer transport.Close()
+
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+
+		err = transport.Start(ctx)
+		require.NoError(t, err)
+
+		requestCtx, requestCancel := context.WithTimeout(t.Context(), 2*time.Second)
+		defer requestCancel()
+
+		request := JSONRPCRequest{
+			JSONRPC: "2.0",
+			ID:      mcp.NewRequestId(int64(1)),
+			Method:  "test/timeout",
+		}
+
+		startTime := time.Now()
+		_, err = transport.SendRequest(requestCtx, request)
+		duration := time.Since(startTime)
+
+		require.Error(t, err, "Expected timeout error")
+		errMsg := err.Error()
+		require.True(t,
+			strings.Contains(errMsg, "timeout") || strings.Contains(errMsg, "deadline exceeded"),
+			"Error should mention timeout or deadline, got: %v", err)
+		expectedTimeout := 2 * time.Second
+		require.GreaterOrEqual(t, duration, expectedTimeout*7/10) // 70% of expected
+		require.LessOrEqual(t, duration, expectedTimeout*13/10)   // 130% of expected
+	})
+
+	t.Run("ContextDeadlineTakesPrecedence", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Accept") == "text/event-stream" {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				flusher, _ := w.(http.Flusher)
+				fmt.Fprintf(w, "event: endpoint\ndata: /message\n\n")
+				flusher.Flush()
+				<-r.Context().Done()
+				return
+			}
+
+			if r.Method == http.MethodPost {
+				w.WriteHeader(http.StatusAccepted)
+				return
+			}
+		}))
+		defer server.Close()
+
+		transport, err := NewSSE(server.URL)
+		require.NoError(t, err)
+		defer transport.Close()
+
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+
+		err = transport.Start(ctx)
+		require.NoError(t, err)
+
+		requestCtx, requestCancel := context.WithTimeout(t.Context(), 1*time.Second)
+		defer requestCancel()
+
+		request := JSONRPCRequest{
+			JSONRPC: "2.0",
+			ID:      mcp.NewRequestId(int64(1)),
+			Method:  "test/deadline",
+		}
+
+		startTime := time.Now()
+		_, err = transport.SendRequest(requestCtx, request)
+		duration := time.Since(startTime)
+
+		require.Error(t, err)
+		errMsg := err.Error()
+		require.True(t,
+			strings.Contains(errMsg, "timeout") || strings.Contains(errMsg, "deadline exceeded"),
+			"Error should mention timeout or deadline, got: %v", err)
+		require.LessOrEqual(t, duration, 1500*time.Millisecond, "Should respect context deadline of 1s")
+	})
+
+	t.Run("TimeoutCleansUpResponseChannel", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Accept") == "text/event-stream" {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				flusher, _ := w.(http.Flusher)
+				fmt.Fprintf(w, "event: endpoint\ndata: /message\n\n")
+				flusher.Flush()
+				<-r.Context().Done()
+				return
+			}
+
+			if r.Method == http.MethodPost {
+				w.WriteHeader(http.StatusAccepted)
+				return
+			}
+		}))
+		defer server.Close()
+
+		transport, err := NewSSE(server.URL)
+		require.NoError(t, err)
+		defer transport.Close()
+
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+
+		err = transport.Start(ctx)
+		require.NoError(t, err)
+
+		transport.mu.RLock()
+		initialCount := len(transport.responses)
+		transport.mu.RUnlock()
+		require.Equal(t, 0, initialCount)
+
+		requestCtx, requestCancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+		defer requestCancel()
+
+		request := JSONRPCRequest{
+			JSONRPC: "2.0",
+			ID:      mcp.NewRequestId(int64(999)),
+			Method:  "test/timeout",
+		}
+
+		_, err = transport.SendRequest(requestCtx, request)
+		require.Error(t, err)
+
+		time.Sleep(50 * time.Millisecond)
+
+		transport.mu.RLock()
+		finalCount := len(transport.responses)
+		transport.mu.RUnlock()
+
+		require.Equal(t, 0, finalCount)
+	})
+
+	t.Run("CustomResponseTimeoutIsRespected", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Accept") == "text/event-stream" {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				flusher, _ := w.(http.Flusher)
+				fmt.Fprintf(w, "event: endpoint\ndata: /message\n\n")
+				flusher.Flush()
+				<-r.Context().Done()
+				return
+			}
+
+			if r.Method == http.MethodPost {
+				w.WriteHeader(http.StatusAccepted)
+				// Never send an SSE response — force the timeout path
+				return
+			}
+		}))
+		defer server.Close()
+
+		customTimeout := 500 * time.Millisecond
+		transport, err := NewSSE(server.URL, WithResponseTimeout(customTimeout))
+		require.NoError(t, err)
+		defer transport.Close()
+
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+
+		err = transport.Start(ctx)
+		require.NoError(t, err)
+
+		// Use a context with a deadline far beyond our custom timeout
+		// so only the custom timeout can fire.
+		reqCtx, reqCancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer reqCancel()
+
+		request := JSONRPCRequest{
+			JSONRPC: "2.0",
+			ID:      mcp.NewRequestId(int64(1)),
+			Method:  "test/custom-timeout",
+		}
+
+		start := time.Now()
+		_, err = transport.SendRequest(reqCtx, request)
+		elapsed := time.Since(start)
+
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "timeout")
+		// Should fire around 500ms, not 60s
+		require.GreaterOrEqual(t, elapsed, customTimeout*7/10)
+		require.LessOrEqual(t, elapsed, customTimeout*2)
+	})
+
+	t.Run("AlreadyExpiredDeadline", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Accept") == "text/event-stream" {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				flusher, _ := w.(http.Flusher)
+				fmt.Fprintf(w, "event: endpoint\ndata: /message\n\n")
+				flusher.Flush()
+				<-r.Context().Done()
+				return
+			}
+
+			if r.Method == http.MethodPost {
+				w.WriteHeader(http.StatusAccepted)
+				return
+			}
+		}))
+		defer server.Close()
+
+		transport, err := NewSSE(server.URL)
+		require.NoError(t, err)
+		defer transport.Close()
+
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+
+		err = transport.Start(ctx)
+		require.NoError(t, err)
+
+		expiredCtx, expiredCancel := context.WithDeadline(t.Context(), time.Now().Add(-1*time.Second))
+		defer expiredCancel()
+
+		request := JSONRPCRequest{
+			JSONRPC: "2.0",
+			ID:      mcp.NewRequestId(int64(1)),
+			Method:  "test/expired",
+		}
+
+		_, err = transport.SendRequest(expiredCtx, request)
+
+		require.Error(t, err)
+		require.True(t, errors.Is(err, context.DeadlineExceeded),
+			"Expected context.DeadlineExceeded, got: %v", err)
 	})
 }

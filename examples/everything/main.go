@@ -6,7 +6,9 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -31,34 +33,35 @@ const (
 )
 
 func NewMCPServer() *server.MCPServer {
-
 	hooks := &server.Hooks{}
 
+	// All hook output goes to stderr. In stdio mode, stdout is the JSON-RPC
+	// transport; writing to stdout from hooks corrupts the protocol stream.
 	hooks.AddBeforeAny(func(ctx context.Context, id any, method mcp.MCPMethod, message any) {
-		fmt.Printf("beforeAny: %s, %v, %v\n", method, id, message)
+		fmt.Fprintf(os.Stderr, "beforeAny: %s, %v, %v\n", method, id, message)
 	})
 	hooks.AddOnSuccess(func(ctx context.Context, id any, method mcp.MCPMethod, message any, result any) {
-		fmt.Printf("onSuccess: %s, %v, %v, %v\n", method, id, message, result)
+		fmt.Fprintf(os.Stderr, "onSuccess: %s, %v, %v, %v\n", method, id, message, result)
 	})
 	hooks.AddOnError(func(ctx context.Context, id any, method mcp.MCPMethod, message any, err error) {
-		fmt.Printf("onError: %s, %v, %v, %v\n", method, id, message, err)
+		fmt.Fprintf(os.Stderr, "onError: %s, %v, %v, %v\n", method, id, message, err)
 	})
 	hooks.AddBeforeInitialize(func(ctx context.Context, id any, message *mcp.InitializeRequest) {
-		fmt.Printf("beforeInitialize: %v, %v\n", id, message)
+		fmt.Fprintf(os.Stderr, "beforeInitialize: %v, %v\n", id, message)
 	})
 	hooks.AddOnRequestInitialization(func(ctx context.Context, id any, message any) error {
-		fmt.Printf("AddOnRequestInitialization: %v, %v\n", id, message)
+		fmt.Fprintf(os.Stderr, "AddOnRequestInitialization: %v, %v\n", id, message)
 		// authorization verification and other preprocessing tasks are performed.
 		return nil
 	})
 	hooks.AddAfterInitialize(func(ctx context.Context, id any, message *mcp.InitializeRequest, result *mcp.InitializeResult) {
-		fmt.Printf("afterInitialize: %v, %v, %v\n", id, message, result)
+		fmt.Fprintf(os.Stderr, "afterInitialize: %v, %v, %v\n", id, message, result)
 	})
-	hooks.AddAfterCallTool(func(ctx context.Context, id any, message *mcp.CallToolRequest, result *mcp.CallToolResult) {
-		fmt.Printf("afterCallTool: %v, %v, %v\n", id, message, result)
+	hooks.AddAfterCallTool(func(ctx context.Context, id any, message *mcp.CallToolRequest, result any) {
+		fmt.Fprintf(os.Stderr, "afterCallTool: %v, %v, %v\n", id, message, result)
 	})
 	hooks.AddBeforeCallTool(func(ctx context.Context, id any, message *mcp.CallToolRequest) {
-		fmt.Printf("beforeCallTool: %v, %v\n", id, message)
+		fmt.Fprintf(os.Stderr, "beforeCallTool: %v, %v\n", id, message)
 	})
 
 	mcpServer := server.NewMCPServer(
@@ -69,11 +72,15 @@ func NewMCPServer() *server.MCPServer {
 		server.WithToolCapabilities(true),
 		server.WithLogging(),
 		server.WithHooks(hooks),
+		server.WithCompletions(),
+		server.WithPromptCompletionProvider(&promptCompletionProvider{}),
+		server.WithResourceCompletionProvider(&resourceCompletionProvider{}),
 	)
 
 	mcpServer.AddResource(mcp.NewResource("test://static/resource",
 		"Static Resource",
 		mcp.WithMIMEType("text/plain"),
+		mcp.WithResourceIcons(mcp.Icon{Src: "https://example.com/icon.png", MIMEType: "image/png"}),
 	), handleReadResource)
 	mcpServer.AddResourceTemplate(
 		mcp.NewResourceTemplate(
@@ -90,6 +97,7 @@ func NewMCPServer() *server.MCPServer {
 
 	mcpServer.AddPrompt(mcp.NewPrompt(string(SIMPLE),
 		mcp.WithPromptDescription("A simple prompt"),
+		mcp.WithPromptIcons(mcp.Icon{Src: "https://example.com/prompt.png"}),
 	), handleSimplePrompt)
 	mcpServer.AddPrompt(mcp.NewPrompt(string(COMPLEX),
 		mcp.WithPromptDescription("A complex prompt"),
@@ -108,6 +116,7 @@ func NewMCPServer() *server.MCPServer {
 			mcp.Description("Message to echo"),
 			mcp.Required(),
 		),
+		mcp.WithToolIcons(mcp.Icon{Src: "https://example.com/tool.png", Sizes: []string{"32x32"}}),
 	), handleEchoTool)
 
 	mcpServer.AddTool(
@@ -202,7 +211,7 @@ func handleGetResourceLinkTool(
 
 func generateResources() []mcp.Resource {
 	resources := make([]mcp.Resource, 100)
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		uri := fmt.Sprintf("test://static/resource/%d", i+1)
 		if i%2 == 0 {
 			resources[i] = mcp.Resource{
@@ -278,7 +287,7 @@ func handleGeneratedResource(
 			mcp.BlobResourceContents{
 				URI:      uri,
 				MIMEType: "application/octet-stream",
-				Blob:     base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("Binary content for resource %d", num))),
+				Blob:     base64.StdEncoding.EncodeToString(fmt.Appendf(nil, "Binary content for resource %d", num)),
 			},
 		}, nil
 	}
@@ -347,7 +356,7 @@ func handleEchoTool(
 	arguments := request.GetArguments()
 	message, ok := arguments["message"].(string)
 	if !ok {
-		return nil, fmt.Errorf("invalid message argument")
+		return mcp.NewToolResultError("invalid message argument: expected string"), nil
 	}
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{
@@ -367,7 +376,7 @@ func handleAddTool(
 	a, ok1 := arguments["a"].(float64)
 	b, ok2 := arguments["b"].(float64)
 	if !ok1 || !ok2 {
-		return nil, fmt.Errorf("invalid number arguments")
+		return mcp.NewToolResultError("invalid number arguments: expected numeric values for 'a' and 'b'"), nil
 	}
 	sum := a + b
 	return &mcp.CallToolResult{
@@ -384,7 +393,6 @@ func handleSendNotification(
 	ctx context.Context,
 	request mcp.CallToolRequest,
 ) (*mcp.CallToolResult, error) {
-
 	server := server.ServerFromContext(ctx)
 
 	err := server.SendNotificationToClient(
@@ -498,11 +506,78 @@ func handleGetTinyImageTool(
 	}, nil
 }
 
+var styles = []string{"formal", "casual", "technical", "creative"}
+
 func handleNotification(
 	ctx context.Context,
 	notification mcp.JSONRPCNotification,
 ) {
 	log.Printf("Received notification: %s", notification.Method)
+}
+
+type promptCompletionProvider struct{}
+
+func (p *promptCompletionProvider) CompletePromptArgument(ctx context.Context, promptName string, argument mcp.CompleteArgument, context mcp.CompleteContext) (*mcp.Completion, error) {
+	switch promptName {
+	case string(COMPLEX):
+		if argument.Name == "style" {
+			var suggestions []string
+			for _, style := range styles {
+				if argument.Value == "" || strings.HasPrefix(style, argument.Value) {
+					suggestions = append(suggestions, style)
+				}
+			}
+			return &mcp.Completion{
+				Values: suggestions,
+			}, nil
+		}
+		fallthrough
+	default:
+		return &mcp.Completion{
+			Values: []string{},
+		}, nil
+	}
+}
+
+type resourceCompletionProvider struct{}
+
+// CompleteResourceArgument here is implemented to return suggestions for "test://dynamic/resource/{id}" template, specifically for the "id" argument.
+func (p *resourceCompletionProvider) CompleteResourceArgument(ctx context.Context, uri string, argument mcp.CompleteArgument, context mcp.CompleteContext) (*mcp.Completion, error) {
+	if uri == "test://dynamic/resource/{id}" && argument.Name == "id" {
+		if len(argument.Value) == 0 {
+			return &mcp.Completion{
+				Values:  getIdSuggestions(0),
+				Total:   maxId,
+				HasMore: true,
+			}, nil
+		}
+
+		// If the input is not a number, return empty suggestion.
+		intArgVal, err := strconv.Atoi(argument.Value)
+		if err != nil {
+			return &mcp.Completion{
+				Values: []string{},
+			}, nil
+		}
+
+		digits := len(argument.Value)
+
+		// If the input is out of range, return empty suggestion.
+		if !isIdInRange(intArgVal) {
+			return &mcp.Completion{
+				Values: []string{},
+			}, nil
+		}
+
+		return &mcp.Completion{
+			Values:  getIdSuggestions(intArgVal),
+			Total:   getTotalIds(digits),
+			HasMore: hasMoreIds(digits),
+		}, nil
+	}
+	return &mcp.Completion{
+		Values: []string{},
+	}, nil
 }
 
 func main() {

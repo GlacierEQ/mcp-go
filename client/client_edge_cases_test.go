@@ -1,7 +1,6 @@
 package client
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -21,7 +20,7 @@ func TestClient_UnsupportedProtocolVersionResponse(t *testing.T) {
 		transport: mockTrans,
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 	err := client.Start(ctx)
 	require.NoError(t, err)
 
@@ -61,7 +60,7 @@ func TestClient_OperationsBeforeInitialize(t *testing.T) {
 		transport: mockTrans,
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 	err := client.Start(ctx)
 	require.NoError(t, err)
 
@@ -89,7 +88,7 @@ func TestClient_NotificationHandlers(t *testing.T) {
 			transport: mockTrans,
 		}
 
-		ctx := context.Background()
+		ctx := t.Context()
 		err := client.Start(ctx)
 		require.NoError(t, err)
 
@@ -97,7 +96,7 @@ func TestClient_NotificationHandlers(t *testing.T) {
 		var handlerCalls int
 
 		// Register multiple handlers
-		for i := 0; i < 3; i++ {
+		for i := range 3 {
 			handlerID := i
 			client.OnNotification(func(notification mcp.JSONRPCNotification) {
 				callOrder = append(callOrder, handlerID)
@@ -155,7 +154,7 @@ func TestClient_IsInitialized(t *testing.T) {
 	// Should not be initialized initially
 	assert.False(t, client.IsInitialized())
 
-	ctx := context.Background()
+	ctx := t.Context()
 	err := client.Start(ctx)
 	require.NoError(t, err)
 

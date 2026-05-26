@@ -6,6 +6,7 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/mark3labs/mcp-go?cache)](https://goreportcard.com/report/github.com/mark3labs/mcp-go)
 [![GoDoc](https://pkg.go.dev/badge/github.com/mark3labs/mcp-go.svg)](https://pkg.go.dev/github.com/mark3labs/mcp-go)
 
+[![AgentRank](https://agentrank-ai.com/api/badge/tool/mark3labs--mcp-go)](https://agentrank-ai.com/tool/mark3labs--mcp-go/)
 <strong>A Go implementation of the Model Context Protocol (MCP), enabling seamless integration between LLM applications and external data sources and tools.</strong>
 
 <br>
@@ -94,6 +95,7 @@ MCP Go handles all the complex protocol details and server management, so you ca
 - [Examples](#examples)
 - [Extras](#extras)
   - [Transports](#transports)
+  - [OAuth Protected Resource Metadata](#oauth-protected-resource-metadata)
   - [Session Management](#session-management)
     - [Basic Session Handling](#basic-session-handling)
     - [Per-Session Tools](#per-session-tools)
@@ -196,13 +198,15 @@ func main() {
 
 ## What is MCP?
 
-The [Model Context Protocol (MCP)](https://modelcontextprotocol.io) lets you build servers that expose data and functionality to LLM applications in a secure, standardized way. Think of it like a web API, but specifically designed for LLM interactions. MCP servers can:
+The [Model Context Protocol (MCP)](https://modelcontextprotocol.io) lets you build servers that expose data and functionality to LLM applications in a secure, standardized way. Think of it like a web API, but specifically designed for LLM interactions.
 
+MCP servers can:
 - Expose data through **Resources** (think of these sort of like GET endpoints; they are used to load information into the LLM's context)
 - Provide functionality through **Tools** (sort of like POST endpoints; they are used to execute code or otherwise produce a side effect)
 - Define interaction patterns through **Prompts** (reusable templates for LLM interactions)
 - And more!
 
+mcp-go implements the Model Context Protocol specification version 2025-11-25, with backward compatibility for versions 2025-06-18, 2025-03-26, and 2024-11-05.
 
 ## Core Concepts
 
@@ -307,6 +311,113 @@ The examples are simple but demonstrate the core concepts. Resources can be much
 <summary>Show Tool Examples</summary>
 
 Tools let LLMs take actions through your server. Unlike resources, tools are expected to perform computation and have side effects. They're similar to POST endpoints in a REST API.
+
+#### Task-Augmented Tools
+
+Task-augmented tools execute asynchronously and return results via polling. This is useful for long-running operations that would otherwise block or time out. Task tools support three modes:
+
+- **TaskSupportForbidden** (default): The tool cannot be invoked as a task
+- **TaskSupportOptional**: The tool can be invoked as a task or synchronously
+- **TaskSupportRequired**: The tool must be invoked as a task
+
+```go
+// Example: A tool that requires task execution
+processBatchTool := mcp.NewTool("process_batch",
+    mcp.WithDescription("Process a batch of items asynchronously"),
+    mcp.WithTaskSupport(mcp.TaskSupportRequired),
+    mcp.WithArray("items",
+        mcp.Description("Array of items to process"),
+        mcp.WithStringItems(),
+        mcp.Required(),
+    ),
+)
+
+// Task tool handler returns CreateTaskResult instead of CallToolResult
+s.AddTaskTool(processBatchTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CreateTaskResult, error) {
+    items := request.GetStringSlice("items", []string{})
+    
+    // Long-running work here
+    for i, item := range items {
+        select {
+        case <-ctx.Done():
+            // Task was cancelled
+            return nil, ctx.Err()
+        default:
+            // Process item...
+            processItem(item)
+        }
+    }
+    
+    // Return result - task ID and metadata are managed by the server
+    return &mcp.CreateTaskResult{
+        Task: mcp.Task{
+            // Task fields (ID, status, etc.) are populated by the server
+        },
+    }, nil
+})
+
+// Enable task capabilities when creating the server
+s := server.NewMCPServer(
+    "Task Server",
+    "1.0.0",
+    server.WithTaskCapabilities(
+        true, // listTasks: allows clients to list all tasks
+        true, // cancel: allows clients to cancel running tasks
+        true, // toolCallTasks: enables task augmentation for tools
+    ),
+    server.WithMaxConcurrentTasks(10), // Optional: limit concurrent running tasks
+)
+```
+
+Task execution flow:
+1. Client calls tool with task parameter
+2. Server immediately returns task ID
+3. Tool executes asynchronously in the background
+4. Client polls `tasks/result` to retrieve the result
+5. Server sends task status notifications on completion
+
+For optional task tools, the same tool can be called synchronously (without task parameter) or asynchronously (with task parameter):
+
+```go
+// Tool with optional task support
+analyzeTool := mcp.NewTool("analyze_data",
+    mcp.WithDescription("Analyze data - can run sync or async"),
+    mcp.WithTaskSupport(mcp.TaskSupportOptional),
+    mcp.WithString("data", mcp.Required()),
+)
+
+// Use AddTaskTool for hybrid tools that support both modes
+s.AddTaskTool(analyzeTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CreateTaskResult, error) {
+    // This handler runs when called as a task
+    data := request.GetString("data", "")
+    result := analyzeData(data)
+    
+    return &mcp.CreateTaskResult{
+        Task: mcp.Task{},
+    }, nil
+})
+
+// The server automatically handles both sync and async invocations
+// When called without task param: executes handler and returns immediately
+// When called with task param: executes handler asynchronously
+```
+
+##### Limiting Concurrent Tasks
+
+To prevent resource exhaustion, you can limit the number of concurrent running tasks:
+
+```go
+s := server.NewMCPServer(
+    "Task Server",
+    "1.0.0",
+    server.WithTaskCapabilities(true, true, true),
+    server.WithMaxConcurrentTasks(10), // Allow up to 10 concurrent running tasks
+)
+```
+
+When the limit is reached, new task creation requests will fail with an error. Completed, failed, or cancelled tasks don't count toward the limit - only tasks in "working" status. If `WithMaxConcurrentTasks` is not specified or set to 0, there is no limit on concurrent tasks.
+
+For traditional synchronous tools that execute and return results immediately:
 
 Simple calculation example:
 ```go
@@ -533,11 +644,91 @@ Prompts can include:
 
 For examples, see the [`examples/`](examples/) directory.
 
+Key examples include:
+- [`examples/task_tool/`](examples/task_tool/) - Demonstrates task-augmented tools with TaskSupportRequired and TaskSupportOptional modes
+- [`examples/structured_input_and_output/`](examples/structured_input_and_output/) - Shows how to use struct-based input/output schemas with type-safe tool handlers
+- [`examples/typed_tools/`](examples/typed_tools/) - Demonstrates type-safe tool handlers with strongly-typed arguments
+- [`examples/custom_context/`](examples/custom_context/) - Shows how to use custom contexts in tool handlers
+- Additional examples covering resources, prompts, and more in the examples directory
+
 ## Extras
 
 ### Transports
 
-MCP-Go supports stdio, SSE and streamable-HTTP transport layers. For SSE transport, you can use `SetConnectionLostHandler()` to detect and handle HTTP/2 idle timeout disconnections (NO_ERROR) for implementing reconnection logic.
+MCP-Go supports stdio, SSE and streamable-HTTP transport layers. For SSE transport, you can use `SetConnectionLostHandler()` to detect and handle disconnections for implementing reconnection logic.
+
+### Embedding StreamableHTTP in non-net/http frameworks
+
+`StreamableHTTPServer` is an `http.Handler`, so it can be mounted in any
+router that speaks `net/http`. To embed it in a framework that does **not**
+go through `net/http` (e.g. [fasthttp](https://github.com/valyala/fasthttp)
+or [fiber](https://gofiber.io/)) without buffering the response through an
+adaptor, use the transport-agnostic `Handle` entry point:
+
+```go
+func (s *StreamableHTTPServer) Handle(w HTTPResponseWriter, r *HTTPRequest)
+```
+
+`HTTPRequest` is a plain struct (`Method`, `URL`, `Header`, `Body`,
+`Context`) and `HTTPResponseWriter` is a small interface (`Header`,
+`WriteHeader`, `Write`, `Flush`, `CanStream`). Implementations whose
+underlying transport cannot stream MUST return `false` from `CanStream`;
+the server will then reject GET (SSE listening) with `405 Method Not
+Allowed` and keep POST responses as buffered `application/json` instead of
+upgrading to `text/event-stream`.
+
+See the [HTTP transport docs](https://mcp-go.dev/transports/http#embedding-in-non-nethttp-frameworks)
+for a full fasthttp/fiber adapter example. `ServeHTTP` is unchanged and
+remains the conventional `net/http` entry point.
+
+### OAuth Protected Resource Metadata
+
+Servers that require OAuth can advertise their authorization requirements
+via the [RFC 9728](https://datatracker.ietf.org/doc/html/rfc9728)
+`/.well-known/oauth-protected-resource` endpoint referenced by the
+[MCP authorization spec](https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization).
+Use `server.WithProtectedResourceMetadata` (or
+`server.WithSSEProtectedResourceMetadata`) to auto-mount the endpoint, or
+`server.NewProtectedResourceMetadataHandler` to wire it into a custom router.
+See the [HTTP transport docs](https://mcp-go.dev/transports/http#oauth-protected-resource-metadata-rfc-9728) for examples.
+
+```go
+httpServer := server.NewStreamableHTTPServer(mcpServer,
+    server.WithProtectedResourceMetadata(server.ProtectedResourceMetadataConfig{
+        Resource:             "https://my-mcp-server.com",
+        AuthorizationServers: []string{"https://auth.example.com"},
+        ScopesSupported:      []string{"mcp:read", "mcp:write"},
+    }),
+)
+```
+
+### CORS for browser-based clients
+
+Servers exposed to browser-based MCP clients can opt into Cross-Origin
+Resource Sharing handling on either HTTP transport. CORS is disabled by
+default; configure it explicitly via `server.WithStreamableHTTPCORS` or
+`server.WithSSECORS`:
+
+```go
+httpServer := server.NewStreamableHTTPServer(mcpServer,
+    server.WithEndpointPath("/mcp"),
+    server.WithStreamableHTTPCORS(
+        server.WithCORSAllowedOrigins("https://my-ai-app.com", "http://localhost:3000"),
+        server.WithCORSAllowCredentials(),
+        server.WithCORSMaxAge(300),
+    ),
+)
+```
+
+The transport answers preflight (`OPTIONS`) requests directly and decorates
+simple responses with the appropriate `Access-Control-Allow-Origin`,
+`Access-Control-Allow-Credentials`, `Access-Control-Expose-Headers` and
+`Vary` headers. Sensible defaults are used when the corresponding option is
+omitted (`GET, POST, DELETE, OPTIONS` for methods; `Content-Type,
+Mcp-Session-Id, Last-Event-ID, Authorization` for request headers;
+`Mcp-Session-Id` for exposed headers). Combining `WithCORSAllowedOrigins("*")`
+with `WithCORSAllowCredentials()` echoes the request `Origin` to remain
+spec-compliant.
 
 ### Session Management
 
@@ -764,6 +955,14 @@ Add middleware to tool call handlers using the `server.WithToolHandlerMiddleware
 
 A recovery middleware option is available to recover from panics in a tool call and can be added to the server with the `server.WithRecovery` option.
 
+### Prompt Handler Middleware
+
+Add middleware to prompt handlers using the `server.WithPromptHandlerMiddleware` option. Middlewares can be registered on server creation and are applied on every `prompts/get` call.
+
+### Prompt Filtering
+
+Filter prompts based on context using the `server.WithPromptFilter` option. This works the same way as tool filtering but applies to `prompts/list` results.
+
 ### Regenerating Server Code
 
 Server hooks and request handlers are generated. Regenerate them by running:
@@ -775,3 +974,114 @@ go generate ./...
 You need `go` installed and the `goimports` tool available. The generator runs
 `goimports` automatically to format and fix imports.
 
+### Auto-completions
+
+When users are filling in argument values for a specific prompt (identified by name) or resource template (identified by URI), servers can provide contextual suggestions.
+To enable completion support, use the `server.WithCompletions()` option when creating your server.
+
+#### Completion Providers
+
+You can provide completion logic for both prompt arguments and resource template arguments by implementing the respective interfaces and passing them to the server as options.
+
+<details>
+<summary>Show Completion Provider Examples</summary>
+
+```go
+type MyPromptCompletionProvider struct{}
+
+func (p *MyPromptCompletionProvider) CompletePromptArgument(
+    ctx context.Context,
+    promptName string,
+    argument mcp.CompleteArgument,
+    context mcp.CompleteContext,
+) (*mcp.Completion, error) {
+    // Example: provide style suggestions for a "code_review" prompt
+    if promptName == "code_review" && argument.Name == "style" {
+        styles := []string{"formal", "casual", "technical", "creative"}
+        var suggestions []string
+        
+        // Filter based on current input
+        for _, style := range styles {
+            if strings.HasPrefix(style, argument.Value) {
+                suggestions = append(suggestions, style)
+            }
+        }
+        
+        return &mcp.Completion{
+            Values: suggestions,
+        }, nil
+    }
+    
+    // Return empty suggestions for unhandled cases
+    return &mcp.Completion{Values: []string{}}, nil
+}
+
+type MyResourceCompletionProvider struct{}
+
+func (p *MyResourceCompletionProvider) CompleteResourceArgument(
+    ctx context.Context,
+    uri string,
+    argument mcp.CompleteArgument,
+    context mcp.CompleteContext,
+) (*mcp.Completion, error) {
+    // Example: provide file path completions
+    if uri == "file:///{path}" && argument.Name == "path" {
+        // You can access previously completed arguments from context.Arguments
+        // context.Arguments is a map[string]string of already-resolved arguments
+        
+        paths := getMatchingPaths(argument.Value) // Your custom logic
+        
+        return &mcp.Completion{
+            Values:  paths[:min(len(paths), 100)], // Max 100 items
+            Total:   len(paths),                    // Total available matches
+            HasMore: len(paths) > 100,              // More results available
+        }, nil
+    }
+    
+    return &mcp.Completion{Values: []string{}}, nil
+}
+
+// Register the provider
+mcpServer := server.NewMCPServer(
+    "my-server",
+    "1.0.0",
+    server.WithCompletions(),
+    server.WithPromptCompletionProvider(&MyPromptCompletionProvider{}),
+    server.WithResourceCompletionProvider(&MyResourceCompletionProvider{}),
+)
+```
+
+</details>
+
+#### Completion Context
+
+For prompts or resource templates with multiple arguments, the `CompleteContext` parameter provides access to previously completed arguments. This allows you to provide contextual suggestions based on earlier choices.
+
+<details>
+<summary>Show Completion Context Example</summary>
+
+```go
+func (p *MyProvider) CompleteResourceArgument(
+    ctx context.Context,
+    uri string,
+    argument mcp.CompleteArgument,
+    context mcp.CompleteContext,
+) (*mcp.Completion, error) {
+    // Access previously completed arguments
+    if previousValue, ok := context.Arguments["previous_arg"]; ok {
+        // Provide suggestions based on previous_arg value
+        return getSuggestionsFor(argument.Value, previousValue), nil
+    }
+    
+    return &mcp.Completion{Values: []string{}}, nil
+}
+```
+
+</details>
+
+#### Response Constraints
+
+When returning completion results:
+- Maximum 100 items per response
+- Use `Total` to indicate the total number of available matches
+- Use `HasMore` to signal if additional results exist beyond the returned values

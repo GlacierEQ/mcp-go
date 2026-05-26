@@ -25,6 +25,217 @@ func TestMCPServer_NewMCPServer(t *testing.T) {
 	assert.Equal(t, "1.0.0", server.version)
 }
 
+func TestMCPServer_ImplementationMetadata(t *testing.T) {
+	tests := []struct {
+		name     string
+		options  []ServerOption
+		validate func(t *testing.T, response mcp.JSONRPCMessage)
+	}{
+		{
+			name:    "No implementation metadata",
+			options: []ServerOption{},
+			validate: func(t *testing.T, response mcp.JSONRPCMessage) {
+				resp, ok := response.(mcp.JSONRPCResponse)
+				require.True(t, ok)
+
+				initResult, ok := resp.Result.(mcp.InitializeResult)
+				require.True(t, ok)
+
+				assert.Equal(t, "test-server", initResult.ServerInfo.Name)
+				assert.Equal(t, "1.0.0", initResult.ServerInfo.Version)
+				assert.Empty(t, initResult.ServerInfo.Title)
+				assert.Empty(t, initResult.ServerInfo.Description)
+				assert.Empty(t, initResult.ServerInfo.WebsiteURL)
+				assert.Nil(t, initResult.ServerInfo.Icons)
+			},
+		},
+		{
+			name: "With title",
+			options: []ServerOption{
+				WithTitle("My Server"),
+			},
+			validate: func(t *testing.T, response mcp.JSONRPCMessage) {
+				resp, ok := response.(mcp.JSONRPCResponse)
+				require.True(t, ok)
+
+				initResult, ok := resp.Result.(mcp.InitializeResult)
+				require.True(t, ok)
+
+				assert.Equal(t, "My Server", initResult.ServerInfo.Title)
+			},
+		},
+		{
+			name: "With description",
+			options: []ServerOption{
+				WithDescription("A server that does amazing things"),
+			},
+			validate: func(t *testing.T, response mcp.JSONRPCMessage) {
+				resp, ok := response.(mcp.JSONRPCResponse)
+				require.True(t, ok)
+
+				initResult, ok := resp.Result.(mcp.InitializeResult)
+				require.True(t, ok)
+
+				assert.Equal(t, "A server that does amazing things", initResult.ServerInfo.Description)
+			},
+		},
+		{
+			name: "With website URL",
+			options: []ServerOption{
+				WithWebsiteURL("https://example.com"),
+			},
+			validate: func(t *testing.T, response mcp.JSONRPCMessage) {
+				resp, ok := response.(mcp.JSONRPCResponse)
+				require.True(t, ok)
+
+				initResult, ok := resp.Result.(mcp.InitializeResult)
+				require.True(t, ok)
+
+				assert.Equal(t, "https://example.com", initResult.ServerInfo.WebsiteURL)
+			},
+		},
+		{
+			name: "With icons",
+			options: []ServerOption{
+				WithIcons(
+					mcp.Icon{
+						Src:      "https://example.com/icon.png",
+						MIMEType: "image/png",
+						Sizes:    []string{"48x48"},
+					},
+				),
+			},
+			validate: func(t *testing.T, response mcp.JSONRPCMessage) {
+				resp, ok := response.(mcp.JSONRPCResponse)
+				require.True(t, ok)
+
+				initResult, ok := resp.Result.(mcp.InitializeResult)
+				require.True(t, ok)
+
+				require.Len(t, initResult.ServerInfo.Icons, 1)
+				assert.Equal(t, "https://example.com/icon.png", initResult.ServerInfo.Icons[0].Src)
+				assert.Equal(t, "image/png", initResult.ServerInfo.Icons[0].MIMEType)
+				assert.Equal(t, []string{"48x48"}, initResult.ServerInfo.Icons[0].Sizes)
+			},
+		},
+		{
+			name: "With multiple icons",
+			options: []ServerOption{
+				WithIcons(
+					mcp.Icon{
+						Src:      "https://example.com/icon.png",
+						MIMEType: "image/png",
+						Sizes:    []string{"48x48"},
+					},
+					mcp.Icon{
+						Src:      "https://example.com/icon.svg",
+						MIMEType: "image/svg+xml",
+						Sizes:    []string{"any"},
+					},
+				),
+			},
+			validate: func(t *testing.T, response mcp.JSONRPCMessage) {
+				resp, ok := response.(mcp.JSONRPCResponse)
+				require.True(t, ok)
+
+				initResult, ok := resp.Result.(mcp.InitializeResult)
+				require.True(t, ok)
+
+				require.Len(t, initResult.ServerInfo.Icons, 2)
+				assert.Equal(t, "https://example.com/icon.png", initResult.ServerInfo.Icons[0].Src)
+				assert.Equal(t, "https://example.com/icon.svg", initResult.ServerInfo.Icons[1].Src)
+			},
+		},
+		{
+			name: "With all implementation metadata",
+			options: []ServerOption{
+				WithTitle("My Server"),
+				WithDescription("A server that does amazing things"),
+				WithWebsiteURL("https://example.com"),
+				WithIcons(
+					mcp.Icon{
+						Src:      "https://example.com/icon.png",
+						MIMEType: "image/png",
+						Sizes:    []string{"48x48"},
+					},
+				),
+			},
+			validate: func(t *testing.T, response mcp.JSONRPCMessage) {
+				resp, ok := response.(mcp.JSONRPCResponse)
+				require.True(t, ok)
+
+				initResult, ok := resp.Result.(mcp.InitializeResult)
+				require.True(t, ok)
+
+				assert.Equal(t, "test-server", initResult.ServerInfo.Name)
+				assert.Equal(t, "1.0.0", initResult.ServerInfo.Version)
+				assert.Equal(t, "My Server", initResult.ServerInfo.Title)
+				assert.Equal(t, "A server that does amazing things", initResult.ServerInfo.Description)
+				assert.Equal(t, "https://example.com", initResult.ServerInfo.WebsiteURL)
+				require.Len(t, initResult.ServerInfo.Icons, 1)
+				assert.Equal(t, "https://example.com/icon.png", initResult.ServerInfo.Icons[0].Src)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := NewMCPServer("test-server", "1.0.0", tt.options...)
+			message := mcp.JSONRPCRequest{
+				JSONRPC: "2.0",
+				ID:      mcp.NewRequestId(int64(1)),
+				Request: mcp.Request{
+					Method: "initialize",
+				},
+			}
+			messageBytes, err := json.Marshal(message)
+			require.NoError(t, err)
+
+			response := server.HandleMessage(t.Context(), messageBytes)
+			tt.validate(t, response)
+		})
+	}
+}
+
+func TestMCPServer_WithIcons_DefensiveCopy(t *testing.T) {
+	// Verify that WithIcons makes a defensive copy so external mutation
+	// does not affect the server's stored icons.
+	icons := []mcp.Icon{
+		{
+			Src:      "https://example.com/icon.png",
+			MIMEType: "image/png",
+			Sizes:    []string{"48x48"},
+		},
+	}
+
+	server := NewMCPServer("test-server", "1.0.0", WithIcons(icons...))
+
+	// Mutate the caller's slice and nested Sizes after passing to WithIcons.
+	icons[0].Src = "https://malicious.example.com/icon.png"
+	icons[0].Sizes[0] = "999x999"
+
+	message := mcp.JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      mcp.NewRequestId(int64(1)),
+		Request: mcp.Request{
+			Method: "initialize",
+		},
+	}
+	messageBytes, err := json.Marshal(message)
+	require.NoError(t, err)
+
+	response := server.HandleMessage(t.Context(), messageBytes)
+	resp, ok := response.(mcp.JSONRPCResponse)
+	require.True(t, ok)
+
+	initResult, ok := resp.Result.(mcp.InitializeResult)
+	require.True(t, ok)
+
+	require.Len(t, initResult.ServerInfo.Icons, 1)
+	assert.Equal(t, "https://example.com/icon.png", initResult.ServerInfo.Icons[0].Src)
+	assert.Equal(t, []string{"48x48"}, initResult.ServerInfo.Icons[0].Sizes)
+}
+
 func TestMCPServer_Capabilities(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -129,6 +340,25 @@ func TestMCPServer_Capabilities(t *testing.T) {
 				assert.NotNil(t, initResult.Capabilities.Logging)
 			},
 		},
+		{
+			name: "Experimental capabilities",
+			options: []ServerOption{
+				WithExperimental(map[string]any{
+					"claude/channel": map[string]any{},
+				}),
+			},
+			validate: func(t *testing.T, response mcp.JSONRPCMessage) {
+				resp, ok := response.(mcp.JSONRPCResponse)
+				assert.True(t, ok)
+
+				initResult, ok := resp.Result.(mcp.InitializeResult)
+				assert.True(t, ok)
+
+				assert.NotNil(t, initResult.Capabilities.Experimental)
+				_, hasChannel := initResult.Capabilities.Experimental["claude/channel"]
+				assert.True(t, hasChannel, "expected claude/channel in experimental capabilities")
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -144,7 +374,7 @@ func TestMCPServer_Capabilities(t *testing.T) {
 			messageBytes, err := json.Marshal(message)
 			assert.NoError(t, err)
 
-			response := server.HandleMessage(context.Background(), messageBytes)
+			response := server.HandleMessage(t.Context(), messageBytes)
 			tt.validate(t, response)
 		})
 	}
@@ -183,7 +413,7 @@ func TestMCPServer_Tools(t *testing.T) {
 		{
 			name: "SetTools sends single notifications/tools/list_changed with one active session",
 			action: func(t *testing.T, server *MCPServer, notificationChannel chan mcp.JSONRPCNotification) {
-				err := server.RegisterSession(context.TODO(), &fakeSession{
+				err := server.RegisterSession(t.Context(), &fakeSession{
 					sessionID:           "test",
 					notificationChannel: notificationChannel,
 					initialized:         true,
@@ -214,7 +444,7 @@ func TestMCPServer_Tools(t *testing.T) {
 			name: "SetTools sends single notifications/tools/list_changed per each active session",
 			action: func(t *testing.T, server *MCPServer, notificationChannel chan mcp.JSONRPCNotification) {
 				for i := range 5 {
-					err := server.RegisterSession(context.TODO(), &fakeSession{
+					err := server.RegisterSession(t.Context(), &fakeSession{
 						sessionID:           fmt.Sprintf("test%d", i),
 						notificationChannel: notificationChannel,
 						initialized:         true,
@@ -223,7 +453,7 @@ func TestMCPServer_Tools(t *testing.T) {
 				}
 				// also let's register inactive sessions
 				for i := range 5 {
-					err := server.RegisterSession(context.TODO(), &fakeSession{
+					err := server.RegisterSession(t.Context(), &fakeSession{
 						sessionID:           fmt.Sprintf("test%d", i+5),
 						notificationChannel: notificationChannel,
 						initialized:         false,
@@ -256,7 +486,7 @@ func TestMCPServer_Tools(t *testing.T) {
 		{
 			name: "AddTool sends multiple notifications/tools/list_changed",
 			action: func(t *testing.T, server *MCPServer, notificationChannel chan mcp.JSONRPCNotification) {
-				err := server.RegisterSession(context.TODO(), &fakeSession{
+				err := server.RegisterSession(t.Context(), &fakeSession{
 					sessionID:           "test",
 					notificationChannel: notificationChannel,
 					initialized:         true,
@@ -288,7 +518,7 @@ func TestMCPServer_Tools(t *testing.T) {
 		{
 			name: "DeleteTools sends single notifications/tools/list_changed",
 			action: func(t *testing.T, server *MCPServer, notificationChannel chan mcp.JSONRPCNotification) {
-				err := server.RegisterSession(context.TODO(), &fakeSession{
+				err := server.RegisterSession(t.Context(), &fakeSession{
 					sessionID:           "test",
 					notificationChannel: notificationChannel,
 					initialized:         true,
@@ -319,7 +549,7 @@ func TestMCPServer_Tools(t *testing.T) {
 		{
 			name: "DeleteTools with non-existent tools does nothing and not receives notifications from MCPServer",
 			action: func(t *testing.T, server *MCPServer, notificationChannel chan mcp.JSONRPCNotification) {
-				err := server.RegisterSession(context.TODO(), &fakeSession{
+				err := server.RegisterSession(t.Context(), &fakeSession{
 					sessionID:           "test",
 					notificationChannel: notificationChannel,
 					initialized:         true,
@@ -347,7 +577,7 @@ func TestMCPServer_Tools(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ctx := context.Background()
+			ctx := t.Context()
 			server := NewMCPServer("test-server", "1.0.0", WithToolCapabilities(true))
 			_ = server.HandleMessage(ctx, []byte(`{
 				"jsonrpc": "2.0",
@@ -445,9 +675,8 @@ func TestMCPServer_HandleValidMessages(t *testing.T) {
 				resp, ok := response.(mcp.JSONRPCResponse)
 				assert.True(t, ok)
 
-				listResult, ok := resp.Result.(mcp.ListResourcesResult)
+				_, ok = resp.Result.(mcp.ListResourcesResult)
 				assert.True(t, ok)
-				assert.NotNil(t, listResult.Resources)
 			},
 		},
 	}
@@ -457,7 +686,7 @@ func TestMCPServer_HandleValidMessages(t *testing.T) {
 			messageBytes, err := json.Marshal(tt.message)
 			assert.NoError(t, err)
 
-			response := server.HandleMessage(context.Background(), messageBytes)
+			response := server.HandleMessage(t.Context(), messageBytes)
 			assert.NotNil(t, response)
 			tt.validate(t, response)
 		})
@@ -497,7 +726,7 @@ func TestMCPServer_HandlePagination(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			response := server.HandleMessage(
-				context.Background(),
+				t.Context(),
 				[]byte(tt.message),
 			)
 			tt.validate(t, response)
@@ -521,7 +750,7 @@ func TestMCPServer_HandleNotifications(t *testing.T) {
             "method": "notifications/initialized"
         }`
 
-	response := server.HandleMessage(context.Background(), []byte(message))
+	response := server.HandleMessage(t.Context(), []byte(message))
 	assert.Nil(t, response)
 	assert.True(t, notificationReceived)
 }
@@ -599,7 +828,7 @@ func TestMCPServer_SendNotificationToClient(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			server := NewMCPServer("test-server", "1.0.0")
-			ctx := tt.contextPrepare(context.Background(), server)
+			ctx := tt.contextPrepare(t.Context(), server)
 			_ = server.HandleMessage(ctx, []byte(`{
 				"jsonrpc": "2.0",
 				"id": 1,
@@ -679,7 +908,7 @@ func TestMCPServer_SendNotificationToAllClients(t *testing.T) {
 
 	t.Run("all sessions", func(t *testing.T) {
 		server := NewMCPServer("test-server", "1.0.0")
-		ctx := contextPrepare(context.Background(), server)
+		ctx := contextPrepare(t.Context(), server)
 		_ = server.HandleMessage(ctx, []byte(`{
 				"jsonrpc": "2.0",
 				"id": 1,
@@ -803,7 +1032,7 @@ func TestMCPServer_PromptHandling(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			response := server.HandleMessage(
-				context.Background(),
+				t.Context(),
 				[]byte(tt.message),
 			)
 			tt.validate(t, response)
@@ -821,7 +1050,7 @@ func TestMCPServer_Prompts(t *testing.T) {
 		{
 			name: "DeletePrompts sends single notifications/prompts/list_changed",
 			action: func(t *testing.T, server *MCPServer, notificationChannel chan mcp.JSONRPCNotification) {
-				err := server.RegisterSession(context.TODO(), &fakeSession{
+				err := server.RegisterSession(t.Context(), &fakeSession{
 					sessionID:           "test",
 					notificationChannel: notificationChannel,
 					initialized:         true,
@@ -862,7 +1091,7 @@ func TestMCPServer_Prompts(t *testing.T) {
 		{
 			name: "DeletePrompts removes the first prompt and retains the other",
 			action: func(t *testing.T, server *MCPServer, notificationChannel chan mcp.JSONRPCNotification) {
-				err := server.RegisterSession(context.TODO(), &fakeSession{
+				err := server.RegisterSession(t.Context(), &fakeSession{
 					sessionID:           "test",
 					notificationChannel: notificationChannel,
 					initialized:         true,
@@ -915,7 +1144,7 @@ func TestMCPServer_Prompts(t *testing.T) {
 		{
 			name: "DeletePrompts with non-existent prompts does nothing and not receives notifications from MCPServer",
 			action: func(t *testing.T, server *MCPServer, notificationChannel chan mcp.JSONRPCNotification) {
-				err := server.RegisterSession(context.TODO(), &fakeSession{
+				err := server.RegisterSession(t.Context(), &fakeSession{
 					sessionID:           "test",
 					notificationChannel: notificationChannel,
 					initialized:         true,
@@ -967,7 +1196,7 @@ func TestMCPServer_Prompts(t *testing.T) {
 		{
 			name: "SetPrompts sends single notifications/prompts/list_changed with one active session",
 			action: func(t *testing.T, server *MCPServer, notificationChannel chan mcp.JSONRPCNotification) {
-				err := server.RegisterSession(context.TODO(), &fakeSession{
+				err := server.RegisterSession(t.Context(), &fakeSession{
 					sessionID:           "test",
 					notificationChannel: notificationChannel,
 					initialized:         true,
@@ -1011,7 +1240,7 @@ func TestMCPServer_Prompts(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ctx := context.Background()
+			ctx := t.Context()
 			server := NewMCPServer("test-server", "1.0.0", WithPromptCapabilities(true))
 			_ = server.HandleMessage(ctx, []byte(`{
 				"jsonrpc": "2.0",
@@ -1053,7 +1282,7 @@ func TestMCPServer_Resources(t *testing.T) {
 		{
 			name: "DeleteResources sends single notifications/resources/list_changed",
 			action: func(t *testing.T, server *MCPServer, notificationChannel chan mcp.JSONRPCNotification) {
-				err := server.RegisterSession(context.TODO(), &fakeSession{
+				err := server.RegisterSession(t.Context(), &fakeSession{
 					sessionID:           "test",
 					notificationChannel: notificationChannel,
 					initialized:         true,
@@ -1090,7 +1319,7 @@ func TestMCPServer_Resources(t *testing.T) {
 		{
 			name: "DeleteResources removes the first resource and retains the other",
 			action: func(t *testing.T, server *MCPServer, notificationChannel chan mcp.JSONRPCNotification) {
-				err := server.RegisterSession(context.TODO(), &fakeSession{
+				err := server.RegisterSession(t.Context(), &fakeSession{
 					sessionID:           "test",
 					notificationChannel: notificationChannel,
 					initialized:         true,
@@ -1134,7 +1363,7 @@ func TestMCPServer_Resources(t *testing.T) {
 		{
 			name: "DeleteResources with non-existent resources does nothing and not receives notifications from MCPServer",
 			action: func(t *testing.T, server *MCPServer, notificationChannel chan mcp.JSONRPCNotification) {
-				err := server.RegisterSession(context.TODO(), &fakeSession{
+				err := server.RegisterSession(t.Context(), &fakeSession{
 					sessionID:           "test",
 					notificationChannel: notificationChannel,
 					initialized:         true,
@@ -1179,7 +1408,7 @@ func TestMCPServer_Resources(t *testing.T) {
 		{
 			name: "SetResources sends single notifications/resources/list_changed with one active session",
 			action: func(t *testing.T, server *MCPServer, notificationChannel chan mcp.JSONRPCNotification) {
-				err := server.RegisterSession(context.TODO(), &fakeSession{
+				err := server.RegisterSession(t.Context(), &fakeSession{
 					sessionID:           "test",
 					notificationChannel: notificationChannel,
 					initialized:         true,
@@ -1216,7 +1445,7 @@ func TestMCPServer_Resources(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ctx := context.Background()
+			ctx := t.Context()
 			server := NewMCPServer("test-server", "1.0.0", WithResourceCapabilities(true, true))
 			_ = server.HandleMessage(ctx, []byte(`{
 				"jsonrpc": "2.0",
@@ -1305,7 +1534,7 @@ func TestMCPServer_HandleInvalidMessages(t *testing.T) {
 			errs = nil // Reset errors for each test case
 
 			response := server.HandleMessage(
-				context.Background(),
+				t.Context(),
 				[]byte(tt.message),
 			)
 			assert.NotNil(t, response)
@@ -1439,7 +1668,7 @@ func TestMCPServer_HandleUndefinedHandlers(t *testing.T) {
 			errs = nil // Reset errors for each test case
 			beforeResults = nil
 			response := server.HandleMessage(
-				context.Background(),
+				t.Context(),
 				[]byte(tt.message),
 			)
 			assert.NotNil(t, response)
@@ -1530,7 +1759,7 @@ func TestMCPServer_HandleMethodsWithoutCapabilities(t *testing.T) {
 
 			server := NewMCPServer("test-server", "1.0.0", tt.options...)
 			response := server.HandleMessage(
-				context.Background(),
+				t.Context(),
 				[]byte(tt.message),
 			)
 			assert.NotNil(t, response)
@@ -1618,7 +1847,7 @@ func TestMCPServer_Instructions(t *testing.T) {
 			messageBytes, err := json.Marshal(message)
 			assert.NoError(t, err)
 
-			response := server.HandleMessage(context.Background(), messageBytes)
+			response := server.HandleMessage(t.Context(), messageBytes)
 			tt.validate(t, response)
 		})
 	}
@@ -1667,7 +1896,7 @@ func TestMCPServer_ResourceTemplates(t *testing.T) {
 
 	t.Run("Get resource template", func(t *testing.T) {
 		response := server.HandleMessage(
-			context.Background(),
+			t.Context(),
 			[]byte(listMessage),
 		)
 		assert.NotNil(t, response)
@@ -1689,7 +1918,7 @@ func TestMCPServer_ResourceTemplates(t *testing.T) {
 		assert.Equal(t, "test://{a}/test-resource{/b*}", resourceTemplate["uriTemplate"])
 
 		response = server.HandleMessage(
-			context.Background(),
+			t.Context(),
 			[]byte(message),
 		)
 
@@ -1735,7 +1964,7 @@ func TestMCPServer_ResourceTemplates(t *testing.T) {
 
 	t.Run("Get resource template again", func(t *testing.T) {
 		response := server.HandleMessage(
-			context.Background(),
+			t.Context(),
 			[]byte(listMessage),
 		)
 		assert.NotNil(t, response)
@@ -1927,14 +2156,14 @@ func TestMCPServer_WithHooks(t *testing.T) {
 	)
 
 	// Initialize the server
-	_ = server.HandleMessage(context.Background(), []byte(`{
+	_ = server.HandleMessage(t.Context(), []byte(`{
 		"jsonrpc": "2.0",
 		"id": 1,
 		"method": "initialize"
 	}`))
 
 	// Test 1: Verify ping method hooks
-	pingResponse := server.HandleMessage(context.Background(), []byte(`{
+	pingResponse := server.HandleMessage(t.Context(), []byte(`{
 		"jsonrpc": "2.0",
 		"id": 2,
 		"method": "ping"
@@ -1944,7 +2173,7 @@ func TestMCPServer_WithHooks(t *testing.T) {
 	assert.IsType(t, mcp.JSONRPCResponse{}, pingResponse)
 
 	// Test 2: Verify tools/list method hooks
-	toolsListResponse := server.HandleMessage(context.Background(), []byte(`{
+	toolsListResponse := server.HandleMessage(t.Context(), []byte(`{
 		"jsonrpc": "2.0",
 		"id": 3,
 		"method": "tools/list"
@@ -1954,7 +2183,7 @@ func TestMCPServer_WithHooks(t *testing.T) {
 	assert.IsType(t, mcp.JSONRPCResponse{}, toolsListResponse)
 
 	// Test 3: Verify error hooks with invalid tool
-	errorResponse := server.HandleMessage(context.Background(), []byte(`{
+	errorResponse := server.HandleMessage(t.Context(), []byte(`{
 		"jsonrpc": "2.0",
 		"id": 4,
 		"method": "tools/call",
@@ -2021,6 +2250,81 @@ func TestMCPServer_WithHooks(t *testing.T) {
 	)
 }
 
+// TestMCPServer_GetHooks verifies GetHooks returns nil when no hooks are
+// configured and returns the same pointer passed to WithHooks when set.
+func TestMCPServer_GetHooks(t *testing.T) {
+	hooks := &Hooks{}
+	hooks.AddBeforeAny(func(ctx context.Context, id any, method mcp.MCPMethod, message any) {})
+
+	tests := []struct {
+		name      string
+		server    *MCPServer
+		wantHooks *Hooks
+		wantLen   int
+	}{
+		{
+			name:      "no hooks configured returns nil",
+			server:    NewMCPServer("test", "1.0.0"),
+			wantHooks: nil,
+			wantLen:   0,
+		},
+		{
+			name:      "with hooks configured returns same pointer",
+			server:    NewMCPServer("test", "1.0.0", WithHooks(hooks)),
+			wantHooks: hooks,
+			wantLen:   1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.server.GetHooks()
+			if tc.wantHooks == nil {
+				assert.Nil(t, got)
+				return
+			}
+			require.Same(t, tc.wantHooks, got)
+			assert.Len(t, got.OnBeforeAny, tc.wantLen)
+		})
+	}
+}
+
+// TestMCPServer_GetHooks_Composable verifies that third-party libraries can
+// append hooks via GetHooks without replacing existing registrations, and that
+// all composed hooks execute in registration order.
+func TestMCPServer_GetHooks_Composable(t *testing.T) {
+	hooks := &Hooks{}
+	var callOrder []string
+
+	hooks.AddBeforeAny(func(ctx context.Context, id any, method mcp.MCPMethod, message any) {
+		callOrder = append(callOrder, "original")
+	})
+
+	s := NewMCPServer("test", "1.0.0", WithHooks(hooks))
+
+	// Simulate a third-party library getting hooks and appending
+	existing := s.GetHooks()
+	existing.AddBeforeAny(func(ctx context.Context, id any, method mcp.MCPMethod, message any) {
+		callOrder = append(callOrder, "third-party")
+	})
+
+	assert.Len(t, existing.OnBeforeAny, 2)
+
+	// Trigger hooks via a ping request
+	_ = s.HandleMessage(t.Context(), []byte(`{
+		"jsonrpc": "2.0",
+		"id": 1,
+		"method": "initialize"
+	}`))
+	_ = s.HandleMessage(t.Context(), []byte(`{
+		"jsonrpc": "2.0",
+		"id": 2,
+		"method": "ping"
+	}`))
+
+	assert.Equal(t, []string{"original", "third-party", "original", "third-party"}, callOrder)
+}
+
 func TestMCPServer_SessionHooks(t *testing.T) {
 	var (
 		registerCalled   bool
@@ -2057,7 +2361,7 @@ func TestMCPServer_SessionHooks(t *testing.T) {
 		initialized:         false,
 	}
 
-	ctx := context.WithoutCancel(context.Background())
+	ctx := context.WithoutCancel(t.Context())
 	err := server.RegisterSession(ctx, testSession)
 	require.NoError(t, err)
 
@@ -2084,7 +2388,7 @@ func TestMCPServer_SessionHooks_NilHooks(t *testing.T) {
 		initialized:         false,
 	}
 
-	ctx := context.WithoutCancel(context.Background())
+	ctx := context.WithoutCancel(t.Context())
 	err := server.RegisterSession(ctx, testSession)
 	require.NoError(t, err)
 
@@ -2107,7 +2411,7 @@ func TestMCPServer_WithRecover(t *testing.T) {
 		panicToolHandler,
 	)
 
-	response := server.HandleMessage(context.Background(), []byte(`{
+	response := server.HandleMessage(t.Context(), []byte(`{
 		"jsonrpc": "2.0",
 		"id": 4,
 		"method": "tools/call",
@@ -2179,18 +2483,18 @@ func listByPaginationForReflect[T any](
 
 func BenchmarkMCPServer_Pagination(b *testing.B) {
 	list := getTools(10000)
-	ctx := context.Background()
+	ctx := b.Context()
 	server := createTestServer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, _, _ = listByPagination(ctx, server, "dG9vbDY1NA==", list)
 	}
 }
 
 func BenchmarkMCPServer_PaginationForReflect(b *testing.B) {
 	list := getTools(10000)
-	ctx := context.Background()
+	ctx := b.Context()
 	server := createTestServer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, _, _ = listByPaginationForReflect(ctx, server, "dG9vbDY1NA==", list)
 	}
 }
@@ -2303,7 +2607,7 @@ func TestMCPServer_ProtocolNegotiation(t *testing.T) {
 			messageBytes, err := json.Marshal(initRequest)
 			assert.NoError(t, err)
 
-			response := server.HandleMessage(context.Background(), messageBytes)
+			response := server.HandleMessage(t.Context(), messageBytes)
 			assert.NotNil(t, response)
 
 			resp, ok := response.(mcp.JSONRPCResponse)
@@ -2478,7 +2782,7 @@ func TestMCPServer_GetTool(t *testing.T) {
 		server := NewMCPServer("test-server", "1.0.0")
 
 		// Add some tools for concurrent access testing
-		for i := 0; i < 10; i++ {
+		for i := range 10 {
 			server.AddTool(mcp.Tool{
 				Name:        fmt.Sprintf("tool-%d", i),
 				Description: fmt.Sprintf("Tool %d", i),
@@ -2490,7 +2794,7 @@ func TestMCPServer_GetTool(t *testing.T) {
 		var wg sync.WaitGroup
 
 		// Test concurrent reads
-		for i := 0; i < numGoroutines; i++ {
+		for i := range numGoroutines {
 			wg.Add(1)
 			go func(id int) {
 				defer wg.Done()
@@ -2763,7 +3067,7 @@ func TestMCPServer_ListTools(t *testing.T) {
 		server := NewMCPServer("test-server", "1.0.0")
 
 		// Pre-add some tools to test concurrent reads
-		for i := 0; i < 50; i++ {
+		for i := range 50 {
 			server.AddTool(mcp.Tool{
 				Name:        fmt.Sprintf("pre-tool-%d", i),
 				Description: fmt.Sprintf("Pre-added tool %d", i),
@@ -2775,7 +3079,7 @@ func TestMCPServer_ListTools(t *testing.T) {
 		var wg sync.WaitGroup
 
 		// Test concurrent reads (no race conditions in test logic)
-		for i := 0; i < numGoroutines; i++ {
+		for i := range numGoroutines {
 			wg.Add(1)
 			go func(id int) {
 				defer wg.Done()
@@ -2851,7 +3155,10 @@ func TestMCPServer_ListTools(t *testing.T) {
 		// They should NOT be the same reference (different memory addresses)
 		// This verifies that ListTools returns copies, not shared references
 		if len(tools1) > 0 && len(tools2) > 0 {
-			assert.NotSame(t, tools1, tools2, "ListTools should return copies, not shared references")
+			assert.NotEqual(t,
+				reflect.ValueOf(tools1).Pointer(),
+				reflect.ValueOf(tools2).Pointer(),
+				"ListTools should return copies, not shared references")
 		}
 
 		// Modifying one should not affect the other
@@ -2866,4 +3173,1801 @@ func TestMCPServer_ListTools(t *testing.T) {
 		assert.Len(t, tools3, 1)
 		assert.Contains(t, tools3, "test-tool")
 	})
+}
+
+// TestMCPServer_ListResources verifies ListResources returns correct copies of registered resources.
+func TestMCPServer_ListResources(t *testing.T) {
+	t.Run("EmptyServer", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0")
+
+		resources := server.ListResources()
+
+		assert.Nil(t, resources)
+	})
+
+	t.Run("SingleResource", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0",
+			WithResourceCapabilities(false, false),
+		)
+
+		expectedResource := mcp.Resource{
+			URI:         "test://resource-1",
+			Name:        "Test Resource 1",
+			Description: "A test resource",
+			MIMEType:    "text/plain",
+		}
+
+		expectedHandler := func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+			return []mcp.ResourceContents{
+				mcp.TextResourceContents{
+					URI:  request.Params.URI,
+					Text: "test content",
+				},
+			}, nil
+		}
+
+		server.AddResource(expectedResource, expectedHandler)
+
+		resources := server.ListResources()
+
+		assert.NotNil(t, resources)
+		assert.Len(t, resources, 1)
+
+		serverResource, exists := resources["test://resource-1"]
+		assert.True(t, exists)
+		assert.Equal(t, expectedResource, serverResource.Resource)
+		assert.NotNil(t, serverResource.Handler)
+	})
+
+	t.Run("MultipleResources", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0",
+			WithResourceCapabilities(false, false),
+		)
+
+		resourceDefs := []struct {
+			resource mcp.Resource
+			handler  ResourceHandlerFunc
+		}{
+			{
+				resource: mcp.Resource{URI: "test://resource-1", Name: "Resource 1"},
+				handler: func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+					return nil, nil
+				},
+			},
+			{
+				resource: mcp.Resource{URI: "test://resource-2", Name: "Resource 2"},
+				handler: func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+					return nil, nil
+				},
+			},
+			{
+				resource: mcp.Resource{URI: "test://resource-3", Name: "Resource 3"},
+				handler: func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+					return nil, nil
+				},
+			},
+		}
+
+		for _, rd := range resourceDefs {
+			server.AddResource(rd.resource, rd.handler)
+		}
+
+		resources := server.ListResources()
+
+		assert.NotNil(t, resources)
+		assert.Len(t, resources, 3)
+
+		for _, expected := range resourceDefs {
+			serverResource, exists := resources[expected.resource.URI]
+			assert.True(t, exists, "Resource %s should exist", expected.resource.URI)
+			assert.Equal(t, expected.resource, serverResource.Resource)
+			assert.NotNil(t, serverResource.Handler)
+		}
+	})
+
+	t.Run("AfterResourceDeletion", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0",
+			WithResourceCapabilities(false, false),
+		)
+
+		server.AddResource(mcp.Resource{URI: "test://r1", Name: "R1"}, nil)
+		server.AddResource(mcp.Resource{URI: "test://r2", Name: "R2"}, nil)
+		server.AddResource(mcp.Resource{URI: "test://r3", Name: "R3"}, nil)
+
+		resources := server.ListResources()
+		assert.NotNil(t, resources)
+		assert.Len(t, resources, 3)
+
+		server.DeleteResources("test://r2")
+
+		resources = server.ListResources()
+		assert.NotNil(t, resources)
+		assert.Len(t, resources, 2)
+
+		_, exists := resources["test://r1"]
+		assert.True(t, exists)
+		_, exists = resources["test://r2"]
+		assert.False(t, exists)
+		_, exists = resources["test://r3"]
+		assert.True(t, exists)
+	})
+
+	t.Run("SetResourcesReplacesExisting", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0",
+			WithResourceCapabilities(false, false),
+		)
+
+		server.AddResource(mcp.Resource{URI: "test://old-1", Name: "Old 1"}, nil)
+		server.AddResource(mcp.Resource{URI: "test://old-2", Name: "Old 2"}, nil)
+
+		resources := server.ListResources()
+		assert.Len(t, resources, 2)
+
+		server.SetResources(
+			ServerResource{
+				Resource: mcp.Resource{URI: "test://new-1", Name: "New 1"},
+				Handler: func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+					return nil, nil
+				},
+			},
+			ServerResource{
+				Resource: mcp.Resource{URI: "test://new-2", Name: "New 2"},
+				Handler: func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+					return nil, nil
+				},
+			},
+		)
+
+		resources = server.ListResources()
+		assert.NotNil(t, resources)
+		assert.Len(t, resources, 2)
+
+		_, exists := resources["test://old-1"]
+		assert.False(t, exists)
+		_, exists = resources["test://old-2"]
+		assert.False(t, exists)
+		_, exists = resources["test://new-1"]
+		assert.True(t, exists)
+		_, exists = resources["test://new-2"]
+		assert.True(t, exists)
+	})
+
+	t.Run("ConcurrentAccess", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0",
+			WithResourceCapabilities(false, false),
+		)
+
+		for i := range 50 {
+			uri := fmt.Sprintf("test://resource-%d", i)
+			server.AddResource(mcp.Resource{URI: uri, Name: uri}, nil)
+		}
+
+		numGoroutines := 100
+		results := make(chan map[string]*ServerResource, numGoroutines)
+		var wg sync.WaitGroup
+
+		for i := range numGoroutines {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				resources := server.ListResources()
+				results <- resources
+			}(i)
+		}
+
+		wg.Wait()
+		close(results)
+
+		var allResults []map[string]*ServerResource
+		for result := range results {
+			allResults = append(allResults, result)
+		}
+
+		for i, result := range allResults {
+			assert.NotNil(t, result, "Result %d should not be nil", i)
+			assert.Equal(t, 50, len(result), "All concurrent reads should return same number of resources")
+		}
+	})
+
+	t.Run("ConsistentResults", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0",
+			WithResourceCapabilities(false, false),
+		)
+
+		server.AddResource(mcp.Resource{URI: "test://resource", Name: "Test Resource"}, nil)
+
+		resources1 := server.ListResources()
+		resources2 := server.ListResources()
+		resources3 := server.ListResources()
+
+		assert.NotNil(t, resources1)
+		assert.NotNil(t, resources2)
+		assert.NotNil(t, resources3)
+
+		assert.Len(t, resources1, 1)
+		assert.Len(t, resources2, 1)
+		assert.Len(t, resources3, 1)
+
+		assert.Contains(t, resources1, "test://resource")
+		assert.Contains(t, resources2, "test://resource")
+		assert.Contains(t, resources3, "test://resource")
+
+		assert.Equal(t, resources1["test://resource"].Resource, resources2["test://resource"].Resource)
+		assert.Equal(t, resources2["test://resource"].Resource, resources3["test://resource"].Resource)
+	})
+
+	t.Run("ReturnsCopiesNotReferences", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0",
+			WithResourceCapabilities(false, false),
+		)
+
+		server.AddResource(mcp.Resource{URI: "test://resource", Name: "Test Resource"}, nil)
+
+		resources1 := server.ListResources()
+		resources2 := server.ListResources()
+
+		assert.NotNil(t, resources1)
+		assert.NotNil(t, resources2)
+
+		delete(resources1, "test://resource")
+		assert.Len(t, resources1, 0, "Modified copy should be empty")
+		assert.Len(t, resources2, 1, "Original copy should be unchanged")
+		assert.Contains(t, resources2, "test://resource")
+
+		resources3 := server.ListResources()
+		assert.NotNil(t, resources3)
+		assert.Len(t, resources3, 1)
+		assert.Contains(t, resources3, "test://resource")
+	})
+}
+
+// TestMCPServer_ListPrompts verifies ListPrompts returns correct copies of registered prompts.
+func TestMCPServer_ListPrompts(t *testing.T) {
+	t.Run("EmptyServer", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0")
+
+		prompts := server.ListPrompts()
+
+		assert.Nil(t, prompts)
+	})
+
+	t.Run("SinglePrompt", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0",
+			WithPromptCapabilities(false),
+		)
+
+		expectedPrompt := mcp.Prompt{
+			Name:        "test-prompt",
+			Description: "A test prompt",
+			Arguments: []mcp.PromptArgument{
+				{
+					Name:        "arg1",
+					Description: "First argument",
+					Required:    true,
+				},
+			},
+		}
+
+		expectedHandler := func(ctx context.Context, request mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+			return &mcp.GetPromptResult{
+				Description: "test result",
+				Messages: []mcp.PromptMessage{
+					{
+						Role:    mcp.RoleUser,
+						Content: mcp.TextContent{Type: "text", Text: "test"},
+					},
+				},
+			}, nil
+		}
+
+		server.AddPrompt(expectedPrompt, expectedHandler)
+
+		prompts := server.ListPrompts()
+
+		assert.NotNil(t, prompts)
+		assert.Len(t, prompts, 1)
+
+		serverPrompt, exists := prompts["test-prompt"]
+		assert.True(t, exists)
+		assert.Equal(t, expectedPrompt, serverPrompt.Prompt)
+		assert.NotNil(t, serverPrompt.Handler)
+	})
+
+	t.Run("MultiplePrompts", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0",
+			WithPromptCapabilities(false),
+		)
+
+		promptDefs := []struct {
+			prompt  mcp.Prompt
+			handler PromptHandlerFunc
+		}{
+			{
+				prompt: mcp.Prompt{Name: "prompt-1", Description: "First prompt"},
+				handler: func(ctx context.Context, request mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+					return &mcp.GetPromptResult{}, nil
+				},
+			},
+			{
+				prompt: mcp.Prompt{Name: "prompt-2", Description: "Second prompt"},
+				handler: func(ctx context.Context, request mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+					return &mcp.GetPromptResult{}, nil
+				},
+			},
+			{
+				prompt: mcp.Prompt{Name: "prompt-3", Description: "Third prompt"},
+				handler: func(ctx context.Context, request mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+					return &mcp.GetPromptResult{}, nil
+				},
+			},
+		}
+
+		for _, pd := range promptDefs {
+			server.AddPrompt(pd.prompt, pd.handler)
+		}
+
+		prompts := server.ListPrompts()
+
+		assert.NotNil(t, prompts)
+		assert.Len(t, prompts, 3)
+
+		for _, expected := range promptDefs {
+			serverPrompt, exists := prompts[expected.prompt.Name]
+			assert.True(t, exists, "Prompt %s should exist", expected.prompt.Name)
+			assert.Equal(t, expected.prompt, serverPrompt.Prompt)
+			assert.NotNil(t, serverPrompt.Handler)
+		}
+	})
+
+	t.Run("AfterPromptDeletion", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0",
+			WithPromptCapabilities(false),
+		)
+
+		server.AddPrompt(mcp.Prompt{Name: "p1", Description: "P1"}, nil)
+		server.AddPrompt(mcp.Prompt{Name: "p2", Description: "P2"}, nil)
+		server.AddPrompt(mcp.Prompt{Name: "p3", Description: "P3"}, nil)
+
+		prompts := server.ListPrompts()
+		assert.NotNil(t, prompts)
+		assert.Len(t, prompts, 3)
+
+		server.DeletePrompts("p2")
+
+		prompts = server.ListPrompts()
+		assert.NotNil(t, prompts)
+		assert.Len(t, prompts, 2)
+
+		_, exists := prompts["p1"]
+		assert.True(t, exists)
+		_, exists = prompts["p2"]
+		assert.False(t, exists)
+		_, exists = prompts["p3"]
+		assert.True(t, exists)
+	})
+
+	t.Run("SetPromptsReplacesExisting", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0",
+			WithPromptCapabilities(false),
+		)
+
+		server.AddPrompt(mcp.Prompt{Name: "old-1", Description: "Old 1"}, nil)
+		server.AddPrompt(mcp.Prompt{Name: "old-2", Description: "Old 2"}, nil)
+
+		prompts := server.ListPrompts()
+		assert.Len(t, prompts, 2)
+
+		server.SetPrompts(
+			ServerPrompt{
+				Prompt: mcp.Prompt{Name: "new-1", Description: "New 1"},
+				Handler: func(ctx context.Context, request mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+					return &mcp.GetPromptResult{}, nil
+				},
+			},
+			ServerPrompt{
+				Prompt: mcp.Prompt{Name: "new-2", Description: "New 2"},
+				Handler: func(ctx context.Context, request mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+					return &mcp.GetPromptResult{}, nil
+				},
+			},
+		)
+
+		prompts = server.ListPrompts()
+		assert.NotNil(t, prompts)
+		assert.Len(t, prompts, 2)
+
+		_, exists := prompts["old-1"]
+		assert.False(t, exists)
+		_, exists = prompts["old-2"]
+		assert.False(t, exists)
+		_, exists = prompts["new-1"]
+		assert.True(t, exists)
+		_, exists = prompts["new-2"]
+		assert.True(t, exists)
+	})
+
+	t.Run("ConcurrentAccess", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0",
+			WithPromptCapabilities(false),
+		)
+
+		for i := range 50 {
+			name := fmt.Sprintf("prompt-%d", i)
+			server.AddPrompt(mcp.Prompt{Name: name, Description: name}, nil)
+		}
+
+		numGoroutines := 100
+		results := make(chan map[string]*ServerPrompt, numGoroutines)
+		var wg sync.WaitGroup
+
+		for i := range numGoroutines {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				prompts := server.ListPrompts()
+				results <- prompts
+			}(i)
+		}
+
+		wg.Wait()
+		close(results)
+
+		var allResults []map[string]*ServerPrompt
+		for result := range results {
+			allResults = append(allResults, result)
+		}
+
+		for i, result := range allResults {
+			assert.NotNil(t, result, "Result %d should not be nil", i)
+			assert.Equal(t, 50, len(result), "All concurrent reads should return same number of prompts")
+		}
+	})
+
+	t.Run("ConsistentResults", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0",
+			WithPromptCapabilities(false),
+		)
+
+		server.AddPrompt(mcp.Prompt{Name: "test-prompt", Description: "Test Prompt"}, nil)
+
+		prompts1 := server.ListPrompts()
+		prompts2 := server.ListPrompts()
+		prompts3 := server.ListPrompts()
+
+		assert.NotNil(t, prompts1)
+		assert.NotNil(t, prompts2)
+		assert.NotNil(t, prompts3)
+
+		assert.Len(t, prompts1, 1)
+		assert.Len(t, prompts2, 1)
+		assert.Len(t, prompts3, 1)
+
+		assert.Contains(t, prompts1, "test-prompt")
+		assert.Contains(t, prompts2, "test-prompt")
+		assert.Contains(t, prompts3, "test-prompt")
+
+		assert.Equal(t, prompts1["test-prompt"].Prompt, prompts2["test-prompt"].Prompt)
+		assert.Equal(t, prompts2["test-prompt"].Prompt, prompts3["test-prompt"].Prompt)
+	})
+
+	t.Run("ReturnsCopiesNotReferences", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0",
+			WithPromptCapabilities(false),
+		)
+
+		server.AddPrompt(mcp.Prompt{Name: "test-prompt", Description: "Test Prompt"}, nil)
+
+		prompts1 := server.ListPrompts()
+		prompts2 := server.ListPrompts()
+
+		assert.NotNil(t, prompts1)
+		assert.NotNil(t, prompts2)
+
+		delete(prompts1, "test-prompt")
+		assert.Len(t, prompts1, 0, "Modified copy should be empty")
+		assert.Len(t, prompts2, 1, "Original copy should be unchanged")
+		assert.Contains(t, prompts2, "test-prompt")
+
+		prompts3 := server.ListPrompts()
+		assert.NotNil(t, prompts3)
+		assert.Len(t, prompts3, 1)
+		assert.Contains(t, prompts3, "test-prompt")
+	})
+}
+
+func TestMCPServer_HandleListTools_IncludesTaskTools(t *testing.T) {
+	t.Run("list includes both regular and task tools", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0")
+
+		// Add regular tools
+		regularTool := mcp.Tool{
+			Name:        "regular-tool",
+			Description: "A regular tool",
+			InputSchema: mcp.ToolInputSchema{Type: "object"},
+		}
+		server.AddTool(regularTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{mcp.TextContent{Type: "text", Text: "regular"}},
+			}, nil
+		})
+
+		// Add task tool using AddTaskTool
+		server.AddTaskTool(mcp.Tool{
+			Name:        "task-tool",
+			Description: "A task-augmented tool",
+			InputSchema: mcp.ToolInputSchema{Type: "object"},
+			Execution: &mcp.ToolExecution{
+				TaskSupport: mcp.TaskSupportRequired,
+			},
+		}, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CreateTaskResult, error) {
+			return &mcp.CreateTaskResult{
+				Task: mcp.Task{
+					TaskId: "task-1",
+					Status: mcp.TaskStatusWorking,
+				},
+			}, nil
+		})
+
+		// Create a list tools request
+		request := mcp.ListToolsRequest{}
+
+		// Call handleListTools
+		result, err := server.handleListTools(t.Context(), 1, request)
+
+		// Verify both tools are included
+		require.Nil(t, err)
+		require.NotNil(t, result)
+		assert.Len(t, result.Tools, 2)
+
+		// Verify tools are sorted by name
+		assert.Equal(t, "regular-tool", result.Tools[0].Name)
+		assert.Equal(t, "task-tool", result.Tools[1].Name)
+
+		// Verify task tool has execution metadata
+		assert.NotNil(t, result.Tools[1].Execution)
+		assert.Equal(t, mcp.TaskSupportRequired, result.Tools[1].Execution.TaskSupport)
+	})
+
+	t.Run("list with only task tools", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0")
+
+		// Add only task tools using AddTaskTools
+		server.AddTaskTools(
+			ServerTaskTool{
+				Tool: mcp.Tool{
+					Name:        "task-tool-1",
+					Description: "First task tool",
+					InputSchema: mcp.ToolInputSchema{Type: "object"},
+					Execution: &mcp.ToolExecution{
+						TaskSupport: mcp.TaskSupportRequired,
+					},
+				},
+				Handler: func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CreateTaskResult, error) {
+					return &mcp.CreateTaskResult{
+						Task: mcp.Task{
+							TaskId: "task-1",
+							Status: mcp.TaskStatusWorking,
+						},
+					}, nil
+				},
+			},
+			ServerTaskTool{
+				Tool: mcp.Tool{
+					Name:        "task-tool-2",
+					Description: "Second task tool",
+					InputSchema: mcp.ToolInputSchema{Type: "object"},
+					Execution: &mcp.ToolExecution{
+						TaskSupport: mcp.TaskSupportOptional,
+					},
+				},
+				Handler: func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CreateTaskResult, error) {
+					return &mcp.CreateTaskResult{
+						Task: mcp.Task{
+							TaskId: "task-2",
+							Status: mcp.TaskStatusWorking,
+						},
+					}, nil
+				},
+			},
+		)
+
+		// Create a list tools request
+		request := mcp.ListToolsRequest{}
+
+		// Call handleListTools
+		result, err := server.handleListTools(t.Context(), 1, request)
+
+		// Verify both task tools are included
+		require.Nil(t, err)
+		require.NotNil(t, result)
+		assert.Len(t, result.Tools, 2)
+
+		// Verify correct ordering
+		assert.Equal(t, "task-tool-1", result.Tools[0].Name)
+		assert.Equal(t, "task-tool-2", result.Tools[1].Name)
+	})
+
+	t.Run("empty list when no tools", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0")
+
+		// Create a list tools request
+		request := mcp.ListToolsRequest{}
+
+		// Call handleListTools
+		result, err := server.handleListTools(t.Context(), 1, request)
+
+		// Verify empty list
+		require.Nil(t, err)
+		require.NotNil(t, result)
+		assert.Len(t, result.Tools, 0)
+	})
+
+	t.Run("sorted alphabetically with mixed tools", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0")
+
+		// Add tools in non-alphabetical order
+		server.AddTool(mcp.Tool{
+			Name:        "zebra-tool",
+			Description: "Last alphabetically",
+			InputSchema: mcp.ToolInputSchema{Type: "object"},
+		}, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return &mcp.CallToolResult{}, nil
+		})
+
+		server.AddTaskTool(mcp.Tool{
+			Name:        "alpha-task",
+			Description: "First alphabetically",
+			InputSchema: mcp.ToolInputSchema{Type: "object"},
+			Execution: &mcp.ToolExecution{
+				TaskSupport: mcp.TaskSupportRequired,
+			},
+		}, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CreateTaskResult, error) {
+			return &mcp.CreateTaskResult{
+				Task: mcp.Task{
+					TaskId: "task-alpha",
+					Status: mcp.TaskStatusWorking,
+				},
+			}, nil
+		})
+
+		server.AddTool(mcp.Tool{
+			Name:        "middle-tool",
+			Description: "Middle alphabetically",
+			InputSchema: mcp.ToolInputSchema{Type: "object"},
+		}, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return &mcp.CallToolResult{}, nil
+		})
+
+		// Create a list tools request
+		request := mcp.ListToolsRequest{}
+
+		// Call handleListTools
+		result, err := server.handleListTools(t.Context(), 1, request)
+
+		// Verify correct alphabetical ordering
+		require.Nil(t, err)
+		require.NotNil(t, result)
+		assert.Len(t, result.Tools, 3)
+		assert.Equal(t, "alpha-task", result.Tools[0].Name)
+		assert.Equal(t, "middle-tool", result.Tools[1].Name)
+		assert.Equal(t, "zebra-tool", result.Tools[2].Name)
+	})
+}
+
+func TestMCPServer_AddTaskTool(t *testing.T) {
+	t.Run("add single task tool", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0")
+
+		// Create a task tool
+		tool := mcp.Tool{
+			Name:        "async-tool",
+			Description: "A task-augmented tool",
+			InputSchema: mcp.ToolInputSchema{Type: "object"},
+			Execution: &mcp.ToolExecution{
+				TaskSupport: mcp.TaskSupportRequired,
+			},
+		}
+
+		handler := func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CreateTaskResult, error) {
+			return &mcp.CreateTaskResult{
+				Task: mcp.Task{
+					TaskId: "test-task",
+					Status: mcp.TaskStatusWorking,
+				},
+			}, nil
+		}
+
+		// Add the task tool using AddTaskTool
+		server.AddTaskTool(tool, handler)
+
+		// Verify the tool is registered
+		server.toolsMu.RLock()
+		registeredTool, exists := server.taskTools["async-tool"]
+		server.toolsMu.RUnlock()
+
+		assert.True(t, exists)
+		assert.Equal(t, "async-tool", registeredTool.Tool.Name)
+		assert.Equal(t, "A task-augmented tool", registeredTool.Tool.Description)
+		assert.NotNil(t, registeredTool.Tool.Execution)
+		assert.Equal(t, mcp.TaskSupportRequired, registeredTool.Tool.Execution.TaskSupport)
+		assert.NotNil(t, registeredTool.Handler)
+	})
+
+	t.Run("add multiple task tools", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0")
+
+		// Create task tools
+		tool1 := ServerTaskTool{
+			Tool: mcp.Tool{
+				Name:        "task-tool-1",
+				Description: "First task tool",
+				InputSchema: mcp.ToolInputSchema{Type: "object"},
+				Execution: &mcp.ToolExecution{
+					TaskSupport: mcp.TaskSupportRequired,
+				},
+			},
+			Handler: func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CreateTaskResult, error) {
+				return &mcp.CreateTaskResult{}, nil
+			},
+		}
+
+		tool2 := ServerTaskTool{
+			Tool: mcp.Tool{
+				Name:        "task-tool-2",
+				Description: "Second task tool",
+				InputSchema: mcp.ToolInputSchema{Type: "object"},
+				Execution: &mcp.ToolExecution{
+					TaskSupport: mcp.TaskSupportOptional,
+				},
+			},
+			Handler: func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CreateTaskResult, error) {
+				return &mcp.CreateTaskResult{}, nil
+			},
+		}
+
+		// Add multiple task tools using AddTaskTools
+		server.AddTaskTools(tool1, tool2)
+
+		// Verify both tools are registered
+		server.toolsMu.RLock()
+		registeredTool1, exists1 := server.taskTools["task-tool-1"]
+		registeredTool2, exists2 := server.taskTools["task-tool-2"]
+		totalCount := len(server.taskTools)
+		server.toolsMu.RUnlock()
+
+		assert.True(t, exists1)
+		assert.True(t, exists2)
+		assert.Equal(t, 2, totalCount)
+		assert.Equal(t, "task-tool-1", registeredTool1.Tool.Name)
+		assert.Equal(t, "task-tool-2", registeredTool2.Tool.Name)
+	})
+
+	t.Run("task tools appear in list_tools", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0")
+
+		// Add a task tool
+		server.AddTaskTool(
+			mcp.Tool{
+				Name:        "my-async-tool",
+				Description: "Async operation",
+				InputSchema: mcp.ToolInputSchema{Type: "object"},
+				Execution: &mcp.ToolExecution{
+					TaskSupport: mcp.TaskSupportRequired,
+				},
+			},
+			func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CreateTaskResult, error) {
+				return &mcp.CreateTaskResult{}, nil
+			},
+		)
+
+		// List tools
+		result, err := server.handleListTools(t.Context(), 1, mcp.ListToolsRequest{})
+
+		// Verify the task tool appears in the list
+		require.Nil(t, err)
+		require.NotNil(t, result)
+		assert.Len(t, result.Tools, 1)
+		assert.Equal(t, "my-async-tool", result.Tools[0].Name)
+		assert.NotNil(t, result.Tools[0].Execution)
+		assert.Equal(t, mcp.TaskSupportRequired, result.Tools[0].Execution.TaskSupport)
+	})
+
+	t.Run("implicit tool capabilities registration", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0")
+
+		// Capabilities should be nil initially
+		server.capabilitiesMu.RLock()
+		initialTools := server.capabilities.tools
+		server.capabilitiesMu.RUnlock()
+		assert.Nil(t, initialTools)
+
+		// Add a task tool
+		server.AddTaskTool(
+			mcp.Tool{
+				Name:        "test-tool",
+				Description: "Test tool",
+				InputSchema: mcp.ToolInputSchema{Type: "object"},
+				Execution: &mcp.ToolExecution{
+					TaskSupport: mcp.TaskSupportRequired,
+				},
+			},
+			func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CreateTaskResult, error) {
+				return &mcp.CreateTaskResult{}, nil
+			},
+		)
+
+		// Tool capabilities should now be registered with listChanged=true
+		server.capabilitiesMu.RLock()
+		toolsCapabilities := server.capabilities.tools
+		server.capabilitiesMu.RUnlock()
+
+		assert.NotNil(t, toolsCapabilities)
+		assert.True(t, toolsCapabilities.listChanged)
+	})
+}
+
+func TestMCPServer_ToolNameCollisionValidation(t *testing.T) {
+	t.Run("panic when adding regular tool with same name as task tool", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0")
+
+		// First, add a task tool
+		taskTool := mcp.Tool{
+			Name:        "duplicate-name",
+			Description: "Task tool",
+			Execution: &mcp.ToolExecution{
+				TaskSupport: mcp.TaskSupportRequired,
+			},
+		}
+		server.AddTaskTool(taskTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CreateTaskResult, error) {
+			return &mcp.CreateTaskResult{}, nil
+		})
+
+		// Attempt to add a regular tool with the same name
+		regularTool := mcp.Tool{
+			Name:        "duplicate-name",
+			Description: "Regular tool",
+		}
+
+		// Should panic
+		assert.Panics(t, func() {
+			server.AddTool(regularTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+				return &mcp.CallToolResult{}, nil
+			})
+		}, "Expected panic when adding regular tool with same name as task tool")
+
+		// Verify only the task tool exists
+		server.toolsMu.RLock()
+		_, taskExists := server.taskTools["duplicate-name"]
+		_, regularExists := server.tools["duplicate-name"]
+		server.toolsMu.RUnlock()
+
+		assert.True(t, taskExists, "Task tool should still exist")
+		assert.False(t, regularExists, "Regular tool should not have been added")
+	})
+
+	t.Run("panic when adding task tool with same name as regular tool", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0")
+
+		// First, add a regular tool
+		regularTool := mcp.Tool{
+			Name:        "duplicate-name",
+			Description: "Regular tool",
+		}
+		server.AddTool(regularTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return &mcp.CallToolResult{}, nil
+		})
+
+		// Attempt to add a task tool with the same name
+		taskTool := mcp.Tool{
+			Name:        "duplicate-name",
+			Description: "Task tool",
+			Execution: &mcp.ToolExecution{
+				TaskSupport: mcp.TaskSupportRequired,
+			},
+		}
+
+		// Should panic
+		assert.Panics(t, func() {
+			server.AddTaskTool(taskTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CreateTaskResult, error) {
+				return &mcp.CreateTaskResult{}, nil
+			})
+		}, "Expected panic when adding task tool with same name as regular tool")
+
+		// Verify only the regular tool exists
+		server.toolsMu.RLock()
+		_, regularExists := server.tools["duplicate-name"]
+		_, taskExists := server.taskTools["duplicate-name"]
+		server.toolsMu.RUnlock()
+
+		assert.True(t, regularExists, "Regular tool should still exist")
+		assert.False(t, taskExists, "Task tool should not have been added")
+	})
+
+	t.Run("panic when adding multiple tools with collision via AddTools", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0")
+
+		// Add a task tool first
+		server.AddTaskTool(
+			mcp.Tool{Name: "collision-tool", Description: "Task tool"},
+			func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CreateTaskResult, error) {
+				return &mcp.CreateTaskResult{}, nil
+			},
+		)
+
+		// Attempt to add multiple regular tools, one with collision
+		tools := []ServerTool{
+			{
+				Tool: mcp.Tool{Name: "ok-tool", Description: "No collision"},
+				Handler: func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+					return &mcp.CallToolResult{}, nil
+				},
+			},
+			{
+				Tool: mcp.Tool{Name: "collision-tool", Description: "Colliding tool"},
+				Handler: func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+					return &mcp.CallToolResult{}, nil
+				},
+			},
+		}
+
+		// Should panic
+		assert.Panics(t, func() {
+			server.AddTools(tools...)
+		}, "Expected panic when adding tools with collision")
+	})
+
+	t.Run("panic when adding multiple task tools with collision via AddTaskTools", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0")
+
+		// Add a regular tool first
+		server.AddTool(
+			mcp.Tool{Name: "collision-tool", Description: "Regular tool"},
+			func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+				return &mcp.CallToolResult{}, nil
+			},
+		)
+
+		// Attempt to add multiple task tools, one with collision
+		taskTools := []ServerTaskTool{
+			{
+				Tool: mcp.Tool{
+					Name:        "ok-task-tool",
+					Description: "No collision",
+					Execution:   &mcp.ToolExecution{TaskSupport: mcp.TaskSupportRequired},
+				},
+				Handler: func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CreateTaskResult, error) {
+					return &mcp.CreateTaskResult{}, nil
+				},
+			},
+			{
+				Tool: mcp.Tool{
+					Name:        "collision-tool",
+					Description: "Colliding task tool",
+					Execution:   &mcp.ToolExecution{TaskSupport: mcp.TaskSupportRequired},
+				},
+				Handler: func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CreateTaskResult, error) {
+					return &mcp.CreateTaskResult{}, nil
+				},
+			},
+		}
+
+		// Should panic
+		assert.Panics(t, func() {
+			server.AddTaskTools(taskTools...)
+		}, "Expected panic when adding task tools with collision")
+	})
+
+	t.Run("no collision when tools have different names", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0")
+
+		// Add a regular tool
+		server.AddTool(
+			mcp.Tool{Name: "regular-tool", Description: "Regular tool"},
+			func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+				return &mcp.CallToolResult{}, nil
+			},
+		)
+
+		// Add a task tool with different name - should not panic
+		assert.NotPanics(t, func() {
+			server.AddTaskTool(
+				mcp.Tool{
+					Name:        "task-tool",
+					Description: "Task tool",
+					Execution:   &mcp.ToolExecution{TaskSupport: mcp.TaskSupportRequired},
+				},
+				func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CreateTaskResult, error) {
+					return &mcp.CreateTaskResult{}, nil
+				},
+			)
+		}, "Should not panic when tools have different names")
+
+		// Verify both tools exist
+		server.toolsMu.RLock()
+		_, regularExists := server.tools["regular-tool"]
+		_, taskExists := server.taskTools["task-tool"]
+		server.toolsMu.RUnlock()
+
+		assert.True(t, regularExists)
+		assert.True(t, taskExists)
+	})
+}
+
+type promptCompletionProviderFunc func(ctx context.Context, promptName string, argument mcp.CompleteArgument, context mcp.CompleteContext) (*mcp.Completion, error)
+
+func (fn promptCompletionProviderFunc) CompletePromptArgument(ctx context.Context, promptName string, argument mcp.CompleteArgument, context mcp.CompleteContext) (*mcp.Completion, error) {
+	return fn(ctx, promptName, argument, context)
+}
+
+type resourceCompletionProviderFunc func(ctx context.Context, uri string, argument mcp.CompleteArgument, context mcp.CompleteContext) (*mcp.Completion, error)
+
+func (fn resourceCompletionProviderFunc) CompleteResourceArgument(ctx context.Context, uri string, argument mcp.CompleteArgument, context mcp.CompleteContext) (*mcp.Completion, error) {
+	return fn(ctx, uri, argument, context)
+}
+
+func TestMCPServer_Complete(t *testing.T) {
+	t.Run("Capability not enabled", func(t *testing.T) {
+		message := `{
+			"jsonrpc": "2.0",
+			"id": 1,
+			"method": "completion/complete",
+			"params": {
+				"ref": {
+					"type": "ref/prompt",
+					"name": "code_review"
+				},
+				"argument": {
+					"name": "language",
+					"value": "py"
+				}
+			}
+		}`
+
+		server := NewMCPServer("test-server", "1.0.0")
+		response := server.HandleMessage(t.Context(), []byte(message))
+		assert.Equal(t, mcp.JSONRPCError{
+			JSONRPC: mcp.JSONRPC_VERSION,
+			ID:      mcp.NewRequestId(float64(1)),
+			Error:   mcp.NewJSONRPCErrorDetails(mcp.METHOD_NOT_FOUND, "completions not supported", nil),
+		}, response)
+	})
+
+	t.Run("Invalid ref type", func(t *testing.T) {
+		invalidRefTypeMessage := `{
+			"jsonrpc": "2.0",
+			"id": 1,
+			"method": "completion/complete",
+			"params": {
+				"ref": {
+					"type": "ref/invalid",
+					"name": "unknown"
+				},
+				"argument": {
+					"name": "language",
+					"value": "py"
+				}
+			}
+		}`
+
+		server := NewMCPServer("test-server", "1.0.0", WithCompletions())
+		response := server.HandleMessage(t.Context(), []byte(invalidRefTypeMessage))
+		assert.Equal(t, mcp.JSONRPCError{
+			JSONRPC: mcp.JSONRPC_VERSION,
+			ID:      mcp.NewRequestId(float64(1)),
+			Error:   mcp.NewJSONRPCErrorDetails(mcp.INVALID_REQUEST, "unparsable completion/complete request: unknown reference type: ref/invalid", nil),
+		}, response)
+	})
+
+	t.Run("Default completion providers", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0",
+			WithCompletions(),
+		)
+
+		t.Run("Prompt reference", func(t *testing.T) {
+			promptMessage := `{
+				"jsonrpc": "2.0",
+				"id": 1,
+				"method": "completion/complete",
+				"params": {
+					"ref": {
+						"type": "ref/prompt",
+						"name": "code_review"
+					},
+					"argument": {
+						"name": "language",
+						"value": "py"
+					}
+				}
+			}`
+			response := server.HandleMessage(t.Context(), []byte(promptMessage))
+			assert.Equal(t, mcp.JSONRPCResponse{
+				JSONRPC: mcp.JSONRPC_VERSION,
+				ID:      mcp.NewRequestId(float64(1)),
+				Result: mcp.CompleteResult{
+					Completion: mcp.Completion{
+						Values: []string{},
+					},
+				},
+			}, response)
+		})
+
+		t.Run("Resource reference", func(t *testing.T) {
+			resourceMessage := `{
+				"jsonrpc": "2.0",
+				"id": 1,
+				"method": "completion/complete",
+				"params": {
+					"ref": {
+						"type": "ref/resource",
+						"uri": "language://{language}/code_review"
+					},
+					"argument": {
+						"name": "language",
+						"value": "ja"
+					}
+				}
+			}`
+			response := server.HandleMessage(t.Context(), []byte(resourceMessage))
+			assert.Equal(t, mcp.JSONRPCResponse{
+				JSONRPC: mcp.JSONRPC_VERSION,
+				ID:      mcp.NewRequestId(float64(1)),
+				Result: mcp.CompleteResult{
+					Completion: mcp.Completion{
+						Values: []string{},
+					},
+				},
+			}, response)
+		})
+	})
+
+	t.Run("Custom completion providers", func(t *testing.T) {
+		t.Run("Prompt reference", func(t *testing.T) {
+			message := `{
+				"jsonrpc": "2.0",
+				"id": 1,
+				"method": "completion/complete",
+				"params": {
+					"ref": {
+						"type": "ref/prompt",
+						"name": "code_review"
+					},
+					"argument": {
+						"name": "language",
+						"value": "py"
+					}
+				}
+			}`
+			server := NewMCPServer("test-server", "1.0.0",
+				WithCompletions(),
+				WithPromptCompletionProvider(
+					promptCompletionProviderFunc(func(
+						ctx context.Context,
+						promptName string,
+						argument mcp.CompleteArgument,
+						context mcp.CompleteContext,
+					) (*mcp.Completion, error) {
+						assert.Equal(t, "code_review", promptName)
+						assert.Equal(t, "py", argument.Value)
+						return &mcp.Completion{
+							Values: []string{"python", "pytorch", "pyside"},
+						}, nil
+					}),
+				),
+			)
+			response := server.HandleMessage(t.Context(), []byte(message))
+			assert.Equal(t, mcp.JSONRPCResponse{
+				JSONRPC: mcp.JSONRPC_VERSION,
+				ID:      mcp.NewRequestId(float64(1)),
+				Result: mcp.CompleteResult{
+					Completion: mcp.Completion{
+						Values: []string{"python", "pytorch", "pyside"},
+					},
+				},
+			}, response)
+		})
+
+		t.Run("Resource reference", func(t *testing.T) {
+			message := `{
+				"jsonrpc": "2.0",
+				"id": 1,
+				"method": "completion/complete",
+				"params": {
+					"ref": {
+						"type": "ref/resource",
+						"uri": "action://{language}/{ide}/code_review"
+					},
+					"argument": {
+						"name": "ide",
+						"value": "c"
+					},
+					"context": {
+						"arguments": {
+							"language": "javascript"
+						}
+					}
+				}
+			}`
+			server := NewMCPServer("test-server", "1.0.0",
+				WithCompletions(),
+				WithResourceCompletionProvider(
+					resourceCompletionProviderFunc(func(
+						ctx context.Context,
+						uri string,
+						argument mcp.CompleteArgument,
+						context mcp.CompleteContext,
+					) (*mcp.Completion, error) {
+						assert.Equal(t, "action://{language}/{ide}/code_review", uri)
+						assert.Equal(t, "c", argument.Value)
+						assert.Equal(t, map[string]string{
+							"language": "javascript",
+						}, context.Arguments)
+						return &mcp.Completion{
+							Values:  []string{"cursor", "code"},
+							Total:   10,
+							HasMore: true,
+						}, nil
+					}),
+				),
+			)
+			response := server.HandleMessage(t.Context(), []byte(message))
+			assert.Equal(t, mcp.JSONRPCResponse{
+				JSONRPC: mcp.JSONRPC_VERSION,
+				ID:      mcp.NewRequestId(float64(1)),
+				Result: mcp.CompleteResult{
+					Completion: mcp.Completion{
+						Values:  []string{"cursor", "code"},
+						Total:   10,
+						HasMore: true,
+					},
+				},
+			}, response)
+		})
+	})
+}
+
+func TestMCPServer_TaskSupportValidation(t *testing.T) {
+	t.Run("tool with TaskSupportRequired fails without task param", func(t *testing.T) {
+		server := NewMCPServer("test", "1.0.0")
+
+		// Add a tool with TaskSupportRequired
+		tool := mcp.NewTool("required_task_tool",
+			mcp.WithDescription("A tool that requires task augmentation"),
+			mcp.WithTaskSupport(mcp.TaskSupportRequired),
+		)
+		server.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("success"), nil
+		})
+
+		// Try to call the tool without task param
+		response := server.HandleMessage(t.Context(), []byte(`{
+			"jsonrpc": "2.0",
+			"id": 1,
+			"method": "tools/call",
+			"params": {
+				"name": "required_task_tool"
+			}
+		}`))
+
+		// Should return an error
+		errorResp, ok := response.(mcp.JSONRPCError)
+		require.True(t, ok, "Expected JSONRPCError response, got: %T", response)
+		assert.Equal(t, mcp.METHOD_NOT_FOUND, errorResp.Error.Code)
+		assert.Contains(t, errorResp.Error.Message, "requires task augmentation")
+	})
+
+	t.Run("tool with TaskSupportRequired succeeds with task param", func(t *testing.T) {
+		server := NewMCPServer("test", "1.0.0")
+
+		// Add a tool with TaskSupportRequired
+		tool := mcp.NewTool("required_task_tool",
+			mcp.WithDescription("A tool that requires task augmentation"),
+			mcp.WithTaskSupport(mcp.TaskSupportRequired),
+		)
+		server.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("success"), nil
+		})
+
+		// Create request with task param
+		response := server.HandleMessage(t.Context(), []byte(`{
+			"jsonrpc": "2.0",
+			"id": 1,
+			"method": "tools/call",
+			"params": {
+				"name": "required_task_tool",
+				"task": {
+					"ttl": 3600
+				}
+			}
+		}`))
+
+		// Should return CreateTaskResult with task as direct field (spec-compliant)
+		successResp, ok := response.(mcp.JSONRPCResponse)
+		require.True(t, ok, "Expected JSONRPCResponse, got: %T", response)
+
+		result, ok := successResp.Result.(*mcp.CreateTaskResult)
+		require.True(t, ok, "Expected *mcp.CreateTaskResult, got: %T", successResp.Result)
+
+		// Verify task was created with correct structure
+		require.NotNil(t, result.Task, "Task field should not be nil")
+		assert.NotEmpty(t, result.Task.TaskId)
+	})
+
+	t.Run("tool with TaskSupportOptional works without task param", func(t *testing.T) {
+		server := NewMCPServer("test", "1.0.0")
+
+		// Add a tool with TaskSupportOptional
+		tool := mcp.NewTool("optional_task_tool",
+			mcp.WithDescription("A tool with optional task augmentation"),
+			mcp.WithTaskSupport(mcp.TaskSupportOptional),
+		)
+		server.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("success"), nil
+		})
+
+		// Call without task param
+		response := server.HandleMessage(t.Context(), []byte(`{
+			"jsonrpc": "2.0",
+			"id": 1,
+			"method": "tools/call",
+			"params": {
+				"name": "optional_task_tool"
+			}
+		}`))
+
+		// Should succeed
+		resp, ok := response.(mcp.JSONRPCResponse)
+		require.True(t, ok, "Expected JSONRPCResponse, got: %T", response)
+		result, ok := resp.Result.(*mcp.CallToolResult)
+		require.True(t, ok, "Expected CallToolResult, got: %T", resp.Result)
+		assert.Len(t, result.Content, 1)
+	})
+
+	t.Run("tool with TaskSupportOptional works with task param", func(t *testing.T) {
+		server := NewMCPServer("test", "1.0.0")
+
+		// Add a tool with TaskSupportOptional
+		tool := mcp.NewTool("optional_task_tool",
+			mcp.WithDescription("A tool with optional task augmentation"),
+			mcp.WithTaskSupport(mcp.TaskSupportOptional),
+		)
+		server.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("success"), nil
+		})
+
+		// Call with task param
+		response := server.HandleMessage(t.Context(), []byte(`{
+			"jsonrpc": "2.0",
+			"id": 1,
+			"method": "tools/call",
+			"params": {
+				"name": "optional_task_tool",
+				"task": {
+					"ttl": 3600
+				}
+			}
+		}`))
+
+		// Should return CreateTaskResult with task as direct field (spec-compliant)
+		successResp, ok := response.(mcp.JSONRPCResponse)
+		require.True(t, ok, "Expected JSONRPCResponse, got: %T", response)
+
+		result, ok := successResp.Result.(*mcp.CreateTaskResult)
+		require.True(t, ok, "Expected *mcp.CreateTaskResult, got: %T", successResp.Result)
+
+		// Verify task was created with correct structure
+		require.NotNil(t, result.Task, "Task field should not be nil")
+		assert.NotEmpty(t, result.Task.TaskId)
+	})
+
+	t.Run("tool with TaskSupportForbidden works without task param", func(t *testing.T) {
+		server := NewMCPServer("test", "1.0.0")
+
+		// Add a regular tool (default TaskSupportForbidden)
+		tool := mcp.NewTool("regular_tool",
+			mcp.WithDescription("A regular tool"),
+		)
+		server.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("success"), nil
+		})
+
+		// Call without task param
+		response := server.HandleMessage(t.Context(), []byte(`{
+			"jsonrpc": "2.0",
+			"id": 1,
+			"method": "tools/call",
+			"params": {
+				"name": "regular_tool"
+			}
+		}`))
+
+		// Should succeed
+		resp, ok := response.(mcp.JSONRPCResponse)
+		require.True(t, ok, "Expected JSONRPCResponse, got: %T", response)
+		result, ok := resp.Result.(*mcp.CallToolResult)
+		require.True(t, ok, "Expected CallToolResult, got: %T", resp.Result)
+		assert.Len(t, result.Content, 1)
+	})
+
+	t.Run("tool with TaskSupportForbidden works with task param", func(t *testing.T) {
+		server := NewMCPServer("test", "1.0.0")
+
+		// Add a regular tool (default TaskSupportForbidden)
+		tool := mcp.NewTool("regular_tool",
+			mcp.WithDescription("A regular tool"),
+		)
+		server.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("success"), nil
+		})
+
+		// Call with task param (should still work, just ignores the task param for now)
+		response := server.HandleMessage(t.Context(), []byte(`{
+			"jsonrpc": "2.0",
+			"id": 1,
+			"method": "tools/call",
+			"params": {
+				"name": "regular_tool",
+				"task": {
+					"ttl": 3600
+				}
+			}
+		}`))
+
+		// Should succeed (for now - task param is just ignored)
+		_, ok := response.(mcp.JSONRPCResponse)
+		require.True(t, ok, "Expected JSONRPCResponse, got: %T", response)
+	})
+
+	t.Run("tool without Execution field works normally", func(t *testing.T) {
+		server := NewMCPServer("test", "1.0.0")
+
+		// Add a tool without any task support configuration
+		tool := mcp.NewTool("simple_tool",
+			mcp.WithDescription("A simple tool"),
+		)
+		server.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("success"), nil
+		})
+
+		// Call without task param
+		response := server.HandleMessage(t.Context(), []byte(`{
+			"jsonrpc": "2.0",
+			"id": 1,
+			"method": "tools/call",
+			"params": {
+				"name": "simple_tool"
+			}
+		}`))
+
+		// Should succeed
+		resp, ok := response.(mcp.JSONRPCResponse)
+		require.True(t, ok, "Expected JSONRPCResponse, got: %T", response)
+		result, ok := resp.Result.(*mcp.CallToolResult)
+		require.True(t, ok, "Expected CallToolResult, got: %T", resp.Result)
+		assert.Len(t, result.Content, 1)
+	})
+}
+
+func TestMCPServer_HybridModeDetection(t *testing.T) {
+	t.Run("TaskSupportOptional without task param executes synchronously", func(t *testing.T) {
+		server := NewMCPServer("test", "1.0.0")
+
+		// Add a tool with TaskSupportOptional
+		tool := mcp.NewTool("hybrid_tool",
+			mcp.WithDescription("A tool with optional task augmentation"),
+			mcp.WithTaskSupport(mcp.TaskSupportOptional),
+		)
+		server.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("sync result"), nil
+		})
+
+		// Call without task param - should execute synchronously
+		response := server.HandleMessage(t.Context(), []byte(`{
+			"jsonrpc": "2.0",
+			"id": 1,
+			"method": "tools/call",
+			"params": {
+				"name": "hybrid_tool"
+			}
+		}`))
+
+		// Should succeed with immediate CallToolResult
+		resp, ok := response.(mcp.JSONRPCResponse)
+		require.True(t, ok, "Expected JSONRPCResponse, got: %T", response)
+		result, ok := resp.Result.(*mcp.CallToolResult)
+		require.True(t, ok, "Expected *CallToolResult for sync execution, got: %T", resp.Result)
+		assert.Len(t, result.Content, 1)
+		textContent, ok := result.Content[0].(mcp.TextContent)
+		require.True(t, ok)
+		assert.Equal(t, "sync result", textContent.Text)
+	})
+
+	t.Run("TaskSupportOptional with task param routes to task execution", func(t *testing.T) {
+		server := NewMCPServer("test", "1.0.0")
+
+		// Add a tool with TaskSupportOptional
+		tool := mcp.NewTool("hybrid_tool",
+			mcp.WithDescription("A tool with optional task augmentation"),
+			mcp.WithTaskSupport(mcp.TaskSupportOptional),
+		)
+		server.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("should not see this"), nil
+		})
+
+		// Call with task param - should execute as task
+		response := server.HandleMessage(t.Context(), []byte(`{
+			"jsonrpc": "2.0",
+			"id": 1,
+			"method": "tools/call",
+			"params": {
+				"name": "hybrid_tool",
+				"task": {
+					"ttl": 3600
+				}
+			}
+		}`))
+
+		// Should return CreateTaskResult with task as direct field (spec-compliant)
+		successResp, ok := response.(mcp.JSONRPCResponse)
+		require.True(t, ok, "Expected JSONRPCResponse, got: %T", response)
+
+		// Response should have CreateTaskResult with task field
+		result, ok := successResp.Result.(*mcp.CreateTaskResult)
+		require.True(t, ok, "Expected result to be *mcp.CreateTaskResult, got: %T", successResp.Result)
+
+		// Verify task field exists
+		require.NotNil(t, result.Task, "Expected task field in result")
+
+		// Verify task has required fields
+		assert.NotEmpty(t, result.Task.TaskId, "Expected taskId in task")
+		assert.Equal(t, mcp.TaskStatusWorking, result.Task.Status, "Expected status to be working")
+		assert.NotEmpty(t, result.Task.CreatedAt, "Expected createdAt in task")
+	})
+
+	t.Run("TaskSupportRequired with task param routes to task execution", func(t *testing.T) {
+		server := NewMCPServer("test", "1.0.0")
+
+		// Add a tool with TaskSupportRequired
+		tool := mcp.NewTool("task_only_tool",
+			mcp.WithDescription("A tool that requires task augmentation"),
+			mcp.WithTaskSupport(mcp.TaskSupportRequired),
+		)
+		server.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("should not see this"), nil
+		})
+
+		// Call with task param - should execute as task
+		response := server.HandleMessage(t.Context(), []byte(`{
+			"jsonrpc": "2.0",
+			"id": 1,
+			"method": "tools/call",
+			"params": {
+				"name": "task_only_tool",
+				"task": {
+					"ttl": 3600
+				}
+			}
+		}`))
+
+		// Should return CreateTaskResult with task as direct field (spec-compliant)
+		successResp, ok := response.(mcp.JSONRPCResponse)
+		require.True(t, ok, "Expected JSONRPCResponse, got: %T", response)
+
+		// Response should have CreateTaskResult with task field
+		result, ok := successResp.Result.(*mcp.CreateTaskResult)
+		require.True(t, ok, "Expected result to be *mcp.CreateTaskResult, got: %T", successResp.Result)
+
+		// Verify task field exists
+		require.NotNil(t, result.Task, "Expected task field in result")
+
+		// Verify task has required fields
+		assert.NotEmpty(t, result.Task.TaskId, "Expected taskId in task")
+		assert.Equal(t, mcp.TaskStatusWorking, result.Task.Status, "Expected status to be working")
+		assert.NotEmpty(t, result.Task.CreatedAt, "Expected createdAt in task")
+	})
+
+	t.Run("TaskSupportForbidden with task param executes synchronously", func(t *testing.T) {
+		server := NewMCPServer("test", "1.0.0")
+
+		// Add a regular tool (TaskSupportForbidden)
+		tool := mcp.NewTool("regular_tool",
+			mcp.WithDescription("A regular tool"),
+			mcp.WithTaskSupport(mcp.TaskSupportForbidden),
+		)
+		server.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("sync result"), nil
+		})
+
+		// Call with task param - should still execute synchronously (task param ignored)
+		response := server.HandleMessage(t.Context(), []byte(`{
+			"jsonrpc": "2.0",
+			"id": 1,
+			"method": "tools/call",
+			"params": {
+				"name": "regular_tool",
+				"task": {
+					"ttl": 3600
+				}
+			}
+		}`))
+
+		// Should succeed with immediate CallToolResult
+		resp, ok := response.(mcp.JSONRPCResponse)
+		require.True(t, ok, "Expected JSONRPCResponse, got: %T", response)
+		result, ok := resp.Result.(*mcp.CallToolResult)
+		require.True(t, ok, "Expected CallToolResult, got: %T", resp.Result)
+		assert.Len(t, result.Content, 1)
+	})
+
+	t.Run("tool without Execution field with task param executes synchronously", func(t *testing.T) {
+		server := NewMCPServer("test", "1.0.0")
+
+		// Add a tool without Execution configuration
+		tool := mcp.NewTool("simple_tool",
+			mcp.WithDescription("A simple tool"),
+		)
+		server.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("sync result"), nil
+		})
+
+		// Call with task param - should still execute synchronously (no task support)
+		response := server.HandleMessage(t.Context(), []byte(`{
+			"jsonrpc": "2.0",
+			"id": 1,
+			"method": "tools/call",
+			"params": {
+				"name": "simple_tool",
+				"task": {
+					"ttl": 3600
+				}
+			}
+		}`))
+
+		// Should succeed with immediate CallToolResult
+		resp, ok := response.(mcp.JSONRPCResponse)
+		require.True(t, ok, "Expected JSONRPCResponse, got: %T", response)
+		result, ok := resp.Result.(*mcp.CallToolResult)
+		require.True(t, ok, "Expected CallToolResult, got: %T", resp.Result)
+		assert.Len(t, result.Content, 1)
+	})
+}
+
+func TestServerTaskTool_TypeDefinitions(t *testing.T) {
+	t.Run("TaskToolHandlerFunc type exists", func(t *testing.T) {
+		// Verify that TaskToolHandlerFunc type can be created
+		var handler TaskToolHandlerFunc = func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CreateTaskResult, error) {
+			return &mcp.CreateTaskResult{
+				Task: mcp.Task{
+					TaskId: "test-task",
+					Status: mcp.TaskStatusWorking,
+				},
+			}, nil
+		}
+		assert.NotNil(t, handler)
+	})
+
+	t.Run("ServerTaskTool type exists and can be created", func(t *testing.T) {
+		tool := mcp.NewTool("test-task-tool",
+			mcp.WithDescription("A test task tool"),
+			mcp.WithTaskSupport(mcp.TaskSupportRequired),
+		)
+
+		handler := func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CreateTaskResult, error) {
+			return &mcp.CreateTaskResult{
+				Task: mcp.Task{
+					TaskId: "test-task",
+					Status: mcp.TaskStatusWorking,
+				},
+			}, nil
+		}
+
+		serverTaskTool := ServerTaskTool{
+			Tool:    tool,
+			Handler: handler,
+		}
+
+		assert.Equal(t, "test-task-tool", serverTaskTool.Tool.Name)
+		assert.NotNil(t, serverTaskTool.Handler)
+		assert.Equal(t, mcp.TaskSupportRequired, serverTaskTool.Tool.Execution.TaskSupport)
+	})
+
+	t.Run("taskTools map is initialized in NewMCPServer", func(t *testing.T) {
+		server := NewMCPServer("test-server", "1.0.0")
+		assert.NotNil(t, server)
+		assert.NotNil(t, server.taskTools)
+		assert.Equal(t, 0, len(server.taskTools))
+	})
+}
+
+func TestMCPServer_Use_AppliesMiddlewareToToolCall(t *testing.T) {
+	called := 0
+	countingMW := func(next ToolHandlerFunc) ToolHandlerFunc {
+		return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			called++
+			return next(ctx, req)
+		}
+	}
+
+	s := NewMCPServer("test", "1.0.0")
+	s.AddTool(mcp.NewTool("echo"), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return mcp.NewToolResultText("ok"), nil
+	})
+	s.Use(countingMW)
+
+	resp := s.HandleMessage(t.Context(), []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{}}}`)) //nolint:lll
+	_, ok := resp.(mcp.JSONRPCResponse)
+	require.True(t, ok)
+	assert.Equal(t, 1, called)
+}
+
+func TestMCPServer_Use_MultipleMiddlewaresExecuteInOrder(t *testing.T) {
+	var order []string
+	make := func(label string) ToolHandlerMiddleware {
+		return func(next ToolHandlerFunc) ToolHandlerFunc {
+			return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+				order = append(order, label)
+				return next(ctx, req)
+			}
+		}
+	}
+
+	s := NewMCPServer("test", "1.0.0")
+	s.AddTool(mcp.NewTool("echo"), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return mcp.NewToolResultText("ok"), nil
+	})
+	s.Use(make("first"), make("second"))
+
+	resp := s.HandleMessage(t.Context(), []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{}}}`)) //nolint:lll
+	_, ok := resp.(mcp.JSONRPCResponse)
+	require.True(t, ok)
+	// first registered runs outermost, so executes first
+	assert.Equal(t, []string{"first", "second"}, order)
+}
+
+func TestMCPServer_Use_ConcurrentSafe(t *testing.T) {
+	s := NewMCPServer("test", "1.0.0")
+	s.AddTool(mcp.NewTool("echo"), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return mcp.NewToolResultText("ok"), nil
+	})
+
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Go(func() {
+			s.Use(func(next ToolHandlerFunc) ToolHandlerFunc {
+				return next
+			})
+		})
+	}
+	wg.Wait()
+}
+
+func TestMCPServer_Use_MiddlewareAppliedToRegularToolAsTask(t *testing.T) {
+	// executeRegularToolAsTask runs in a goroutine; use a channel to confirm
+	// the middleware ran before the test exits.
+	mwCalled := make(chan struct{}, 1)
+	countingMW := func(next ToolHandlerFunc) ToolHandlerFunc {
+		return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			mwCalled <- struct{}{}
+			return next(ctx, req)
+		}
+	}
+
+	s := NewMCPServer("test", "1.0.0")
+	tool := mcp.NewTool("hybrid_tool",
+		mcp.WithDescription("hybrid"),
+		mcp.WithTaskSupport(mcp.TaskSupportOptional),
+	)
+	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return mcp.NewToolResultText("ok"), nil
+	})
+	s.Use(countingMW)
+
+	// task param causes handleToolCall to route into executeRegularToolAsTask
+	s.HandleMessage(t.Context(), []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hybrid_tool","task":{"ttl":3600}}}`)) //nolint:lll
+
+	select {
+	case <-mwCalled:
+		// middleware ran in executeRegularToolAsTask path — pass
+	case <-time.After(2 * time.Second):
+		t.Fatal("middleware was not called within executeRegularToolAsTask")
+	}
 }

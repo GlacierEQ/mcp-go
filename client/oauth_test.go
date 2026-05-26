@@ -1,7 +1,6 @@
 package client
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -13,7 +12,7 @@ import (
 )
 
 func TestNewOAuthStreamableHttpClient(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	// Create a test server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Check for Authorization header
@@ -72,7 +71,7 @@ func TestNewOAuthStreamableHttpClient(t *testing.T) {
 	}
 
 	// Start the client
-	if err := client.Start(context.Background()); err != nil {
+	if err := client.Start(t.Context()); err != nil {
 		t.Fatalf("Failed to start client: %v", err)
 	}
 	defer client.Close()
@@ -124,5 +123,89 @@ func TestIsOAuthAuthorizationRequiredError(t *testing.T) {
 	handler = GetOAuthHandler(err2)
 	if handler != nil {
 		t.Errorf("Expected GetOAuthHandler to return nil")
+	}
+}
+
+func TestGetResourceMetadataURL(t *testing.T) {
+	// Test with error containing metadata URL
+	metadataURL := "https://auth.example.com/.well-known/oauth-protected-resource"
+	err := &transport.OAuthAuthorizationRequiredError{
+		Handler: transport.NewOAuthHandler(transport.OAuthConfig{}),
+		AuthorizationRequiredError: transport.AuthorizationRequiredError{
+			ResourceMetadataURL: metadataURL,
+		},
+	}
+
+	// Verify GetResourceMetadataURL returns the correct URL
+	result := GetResourceMetadataURL(err)
+	if result != metadataURL {
+		t.Errorf("Expected GetResourceMetadataURL to return %q, got %q", metadataURL, result)
+	}
+
+	// Test with error containing no metadata URL
+	err2 := &transport.OAuthAuthorizationRequiredError{
+		Handler: transport.NewOAuthHandler(transport.OAuthConfig{}),
+		AuthorizationRequiredError: transport.AuthorizationRequiredError{
+			ResourceMetadataURL: "",
+		},
+	}
+
+	result2 := GetResourceMetadataURL(err2)
+	if result2 != "" {
+		t.Errorf("Expected GetResourceMetadataURL to return empty string, got %q", result2)
+	}
+
+	// Test with non-OAuth error
+	err3 := fmt.Errorf("some other error")
+
+	result3 := GetResourceMetadataURL(err3)
+	if result3 != "" {
+		t.Errorf("Expected GetResourceMetadataURL to return empty string for non-OAuth error, got %q", result3)
+	}
+}
+
+func TestIsAuthorizationRequiredError(t *testing.T) {
+	// Test with base AuthorizationRequiredError (401 without OAuth handler)
+	metadataURL := "https://auth.example.com/.well-known/oauth-protected-resource"
+	err := &transport.AuthorizationRequiredError{
+		ResourceMetadataURL: metadataURL,
+	}
+
+	// Verify IsAuthorizationRequiredError returns true
+	if !IsAuthorizationRequiredError(err) {
+		t.Errorf("Expected IsAuthorizationRequiredError to return true for AuthorizationRequiredError")
+	}
+
+	// Verify GetResourceMetadataURL returns the correct URL
+	result := GetResourceMetadataURL(err)
+	if result != metadataURL {
+		t.Errorf("Expected GetResourceMetadataURL to return %q, got %q", metadataURL, result)
+	}
+
+	// Test with OAuthAuthorizationRequiredError (different type)
+	oauthErr := &transport.OAuthAuthorizationRequiredError{
+		Handler: transport.NewOAuthHandler(transport.OAuthConfig{}),
+		AuthorizationRequiredError: transport.AuthorizationRequiredError{
+			ResourceMetadataURL: metadataURL,
+		},
+	}
+
+	// Verify IsOAuthAuthorizationRequiredError returns true
+	if !IsOAuthAuthorizationRequiredError(oauthErr) {
+		t.Errorf("Expected IsOAuthAuthorizationRequiredError to return true for OAuthAuthorizationRequiredError")
+	}
+
+	// Verify GetResourceMetadataURL works with OAuth error too
+	result2 := GetResourceMetadataURL(oauthErr)
+	if result2 != metadataURL {
+		t.Errorf("Expected GetResourceMetadataURL to return %q, got %q", metadataURL, result2)
+	}
+
+	// Test with non-authorization error
+	err3 := fmt.Errorf("some other error")
+
+	// Verify IsAuthorizationRequiredError returns false
+	if IsAuthorizationRequiredError(err3) {
+		t.Errorf("Expected IsAuthorizationRequiredError to return false for non-authorization error")
 	}
 }

@@ -5,14 +5,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/stretchr/testify/require"
 )
 
 // startMockStreamableHTTPServer starts a test HTTP server that implements
@@ -70,6 +75,7 @@ func startMockStreamableHTTPServer() (string, func()) {
 				"jsonrpc": "2.0",
 				"id":      request["id"],
 				"result":  request,
+				"headers": r.Header,
 			}); err != nil {
 				http.Error(w, "Failed to encode response", http.StatusInternalServerError)
 				return
@@ -122,6 +128,24 @@ func startMockStreamableHTTPServer() (string, func()) {
 				http.Error(w, "Failed to encode response", http.StatusInternalServerError)
 				return
 			}
+		case "debug/echo_header":
+			// Check session ID
+			if r.Header.Get("Mcp-Session-Id") != sessionID {
+				http.Error(w, "Invalid session ID", http.StatusNotFound)
+				return
+			}
+
+			// Echo back the request headers as the response result
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			if err := json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      request["id"],
+				"result":  r.Header,
+			}); err != nil {
+				http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+				return
+			}
 		}
 	})
 
@@ -143,7 +167,7 @@ func TestStreamableHTTP(t *testing.T) {
 	defer trans.Close()
 
 	// Initialize the transport first
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
 	initRequest := JSONRPCRequest{
@@ -159,7 +183,7 @@ func TestStreamableHTTP(t *testing.T) {
 
 	// Now run the tests
 	t.Run("SendRequest", func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 		defer cancel()
 
 		params := map[string]any{
@@ -215,9 +239,49 @@ func TestStreamableHTTP(t *testing.T) {
 		}
 	})
 
+	t.Run("SendRequestWithHeader", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+
+		params := map[string]any{
+			"string": "hello world",
+			"array":  []any{1, 2, 3},
+		}
+
+		hdr := http.Header{"X-Test-Header": {"test-header-value"}}
+		request := JSONRPCRequest{
+			JSONRPC: "2.0",
+			ID:      mcp.NewRequestId(int64(1)),
+			Method:  "debug/echo_header",
+			Params:  params,
+			Header:  hdr,
+		}
+
+		// Send the request
+		response, err := trans.SendRequest(ctx, request)
+		if err != nil {
+			t.Fatalf("SendRequest failed: %v", err)
+		}
+
+		// Parse the result to verify echo
+		var result map[string]any
+		if err := json.Unmarshal(response.Result, &result); err != nil {
+			t.Fatalf("Failed to unmarshal result: %v", err)
+		}
+
+		if headerValues, ok := result["X-Test-Header"].([]any); !ok || len(headerValues) == 0 || headerValues[0] != "test-header-value" {
+			t.Errorf("Expected X-Test-Header to be ['test-header-value'], got %v", result["X-Test-Header"])
+		}
+
+		// Verify system headers are still present
+		if contentType, ok := result["Content-Type"].([]any); !ok || len(contentType) == 0 {
+			t.Errorf("Expected Content-Type header to be preserved")
+		}
+	})
+
 	t.Run("SendRequestWithTimeout", func(t *testing.T) {
 		// Create a context that's already canceled
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(t.Context())
 		cancel() // Cancel the context immediately
 
 		// Prepare a request
@@ -246,7 +310,7 @@ func TestStreamableHTTP(t *testing.T) {
 		})
 
 		// Send a request that triggers a notification
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 		defer cancel()
 
 		request := JSONRPCRequest{
@@ -260,9 +324,7 @@ func TestStreamableHTTP(t *testing.T) {
 			t.Fatalf("SendRequest failed: %v", err)
 		}
 
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			select {
 			case notification := <-notificationChan:
 				// We received a notification
@@ -282,7 +344,7 @@ func TestStreamableHTTP(t *testing.T) {
 			case <-time.After(1 * time.Second):
 				t.Errorf("Expected notification, got none")
 			}
-		}()
+		})
 
 		wg.Wait()
 	})
@@ -296,11 +358,11 @@ func TestStreamableHTTP(t *testing.T) {
 		responses := make([]*JSONRPCResponse, numRequests)
 		errors := make([]error, numRequests)
 
-		for i := 0; i < numRequests; i++ {
+		for i := range numRequests {
 			wg.Add(1)
 			go func(idx int) {
 				defer wg.Done()
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 				defer cancel()
 
 				// Each request has a unique ID and payload
@@ -325,7 +387,7 @@ func TestStreamableHTTP(t *testing.T) {
 		wg.Wait()
 
 		// Check results
-		for i := 0; i < numRequests; i++ {
+		for i := range numRequests {
 			if errors[i] != nil {
 				t.Errorf("Request %d failed: %v", i, errors[i])
 				continue
@@ -376,7 +438,7 @@ func TestStreamableHTTP(t *testing.T) {
 	})
 
 	t.Run("ResponseError", func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 		defer cancel()
 
 		// Prepare a request
@@ -461,7 +523,7 @@ func TestStreamableHTTP(t *testing.T) {
 		defer trans.Close()
 
 		// Send a request
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 		defer cancel()
 
 		request := JSONRPCRequest{
@@ -476,9 +538,7 @@ func TestStreamableHTTP(t *testing.T) {
 			t.Fatalf("SendRequest failed: %v", err)
 		}
 
-		if response == nil {
-			t.Fatal("Expected response, got nil")
-		}
+		require.NotNil(t, response, "Expected response, got nil")
 
 		// Verify the response
 		var result string
@@ -509,7 +569,7 @@ func TestStreamableHTTPErrors(t *testing.T) {
 		}
 
 		// Send request should fail
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 		defer cancel()
 
 		request := JSONRPCRequest{
@@ -726,12 +786,12 @@ func TestContinuousListening(t *testing.T) {
 	})
 
 	// Start the transport - this will launch listenForever in a goroutine
-	if err := trans.Start(context.Background()); err != nil {
+	if err := trans.Start(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 
 	// Initialize the transport first
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
 	initRequest := JSONRPCRequest{
@@ -804,11 +864,11 @@ func TestContinuousListeningMethodNotAllowed(t *testing.T) {
 	}()
 
 	// Initialize the transport first
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
 	// Start the transport
-	if err := trans.Start(context.Background()); err != nil {
+	if err := trans.Start(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -834,6 +894,86 @@ func TestContinuousListeningMethodNotAllowed(t *testing.T) {
 	}
 }
 
+func TestContinuousListeningSessionTerminated(t *testing.T) {
+	// Use a short retry interval so we can verify no retries happen quickly.
+	origRetryInterval := retryInterval
+	retryInterval = 20 * time.Millisecond
+	t.Cleanup(func() { retryInterval = origRetryInterval })
+
+	// Start a server that returns 200 on POST (initialize) but 404 on GET
+	// (simulating a server restart where the session no longer exists).
+	sessionID := "test-session-123"
+	var getCalls int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			// Handle initialize
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set(HeaderKeySessionID, sessionID)
+			resp := JSONRPCResponse{
+				JSONRPC: "2.0",
+				ID:      mcp.NewRequestId(int64(0)),
+				Result:  json.RawMessage(`{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"test"}}`),
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+		if r.Method == http.MethodGet {
+			atomic.AddInt64(&getCalls, 1)
+			// Simulate session terminated: server restarted, session gone
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+	}))
+	defer server.Close()
+
+	// Setup logger to capture log messages
+	logChan := make(chan string, 10)
+	testLogger := &testLogger{logChan: logChan}
+
+	// Create transport with continuous listening enabled
+	trans, err := NewStreamableHTTP(server.URL, WithContinuousListening(), WithLogger(testLogger))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer trans.Close()
+
+	// Start the transport
+	if err := trans.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Initialize
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	initRequest := JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      mcp.NewRequestId(int64(0)),
+		Method:  "initialize",
+	}
+	_, err = trans.SendRequest(ctx, initRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for the error log message that session was terminated.
+	select {
+	case logMsg := <-logChan:
+		if !strings.Contains(logMsg, "session terminated") {
+			t.Errorf("Expected error log about session terminated, got: %s", logMsg)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Timeout waiting for session terminated log; listenForever did not stop retrying")
+	}
+
+	// Verify no further retries: wait several retry intervals and check GET count.
+	time.Sleep(5 * retryInterval)
+	calls := atomic.LoadInt64(&getCalls)
+	if calls != 1 {
+		t.Errorf("Expected exactly 1 GET attempt, got %d (listener retried after session termination)", calls)
+	}
+}
+
 // testLogger is a simple logger for testing
 type testLogger struct {
 	logChan chan string
@@ -845,4 +985,514 @@ func (l *testLogger) Infof(format string, args ...any) {
 
 func (l *testLogger) Errorf(format string, args ...any) {
 	l.logChan <- fmt.Sprintf(format, args...)
+}
+
+func TestStreamableHTTP_Unauthorized_StaticToken(t *testing.T) {
+	// Create a test server that always returns 401
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("Unauthorized"))
+	}))
+	defer server.Close()
+
+	// Create StreamableHTTP with static headers (no OAuth)
+	transport, err := NewStreamableHTTP(server.URL, WithHTTPHeaders(map[string]string{
+		"Authorization": "Bearer static-token",
+	}))
+	if err != nil {
+		t.Fatalf("Failed to create StreamableHTTP: %v", err)
+	}
+
+	// Verify OAuth is not enabled
+	if transport.IsOAuthEnabled() {
+		t.Errorf("Expected IsOAuthEnabled() to return false")
+	}
+
+	// Send a request
+	_, err = transport.SendRequest(t.Context(), JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      mcp.NewRequestId(1),
+		Method:  "test",
+	})
+
+	// Verify the error is ErrUnauthorized
+	if err == nil {
+		t.Fatalf("Expected error, got nil")
+	}
+
+	if !errors.Is(err, ErrAuthorizationRequired) {
+		t.Fatalf("Expected ErrAuthorizationRequired, got %T: %v", err, err)
+	}
+
+	// Verify error message
+	if !strings.Contains(err.Error(), "authorization required") {
+		t.Errorf("Expected error message to contain 'authorization required', got: %v", err)
+	}
+}
+
+func TestStreamableHTTP_SendNotification_Unauthorized_StaticToken(t *testing.T) {
+	// Create a test server that always returns 401
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("Unauthorized"))
+	}))
+	defer server.Close()
+
+	// Create StreamableHTTP with static headers (no OAuth)
+	transport, err := NewStreamableHTTP(server.URL, WithHTTPHeaders(map[string]string{
+		"Authorization": "Bearer static-token",
+	}))
+	if err != nil {
+		t.Fatalf("Failed to create StreamableHTTP: %v", err)
+	}
+
+	// Start the transport (needed for session initialization)
+	if err := transport.Start(t.Context()); err != nil {
+		t.Fatalf("Failed to start transport: %v", err)
+	}
+
+	// Send a notification
+	err = transport.SendNotification(t.Context(), mcp.JSONRPCNotification{
+		JSONRPC: "2.0",
+		Notification: mcp.Notification{
+			Method: "test/notification",
+		},
+	})
+
+	// Verify the error is ErrUnauthorized
+	if err == nil {
+		t.Fatalf("Expected error, got nil")
+	}
+
+	if !errors.Is(err, ErrAuthorizationRequired) {
+		t.Fatalf("Expected ErrAuthorizationRequired, got %T: %v", err, err)
+	}
+}
+
+// TestStreamableHTTP_SendNotification_Accepts204NoContent verifies that SendNotification
+// treats HTTP 204 No Content as a success response per RFC 7231.
+// See: https://github.com/mark3labs/mcp-go/issues/700
+func TestStreamableHTTP_SendNotification_Accepts204NoContent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	transport, err := NewStreamableHTTP(server.URL)
+	if err != nil {
+		t.Fatalf("Failed to create StreamableHTTP: %v", err)
+	}
+
+	if err := transport.Start(t.Context()); err != nil {
+		t.Fatalf("Failed to start transport: %v", err)
+	}
+
+	err = transport.SendNotification(t.Context(), mcp.JSONRPCNotification{
+		JSONRPC: "2.0",
+		Notification: mcp.Notification{
+			Method: "notifications/initialized",
+		},
+	})
+
+	if err != nil {
+		t.Fatalf("SendNotification should accept 204 No Content, got error: %v", err)
+	}
+}
+
+// TestStreamableHTTPHostOverride tests Host header override for StreamableHTTP transport
+func TestStreamableHTTPHostOverride(t *testing.T) {
+	// Create a test server that captures the Host header
+	var capturedHost string
+	var mu sync.Mutex
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		capturedHost = r.Host
+		mu.Unlock()
+
+		// Handle initialize request for StreamableHTTP
+		if r.Method == http.MethodPost {
+			var request JSONRPCRequest
+			decoder := json.NewDecoder(r.Body)
+			if err := decoder.Decode(&request); err != nil {
+				http.Error(w, fmt.Sprintf("Invalid JSON: %v", err), http.StatusBadRequest)
+				return
+			}
+
+			switch request.Method {
+			case "initialize":
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusAccepted)
+				if err := json.NewEncoder(w).Encode(JSONRPCResponse{
+					JSONRPC: request.JSONRPC,
+					ID:      request.ID,
+					Result:  json.RawMessage(`"initialized"`),
+				}); err != nil {
+					http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+					return
+				}
+				return
+			case "test":
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				if err := json.NewEncoder(w).Encode(JSONRPCResponse{
+					JSONRPC: request.JSONRPC,
+					ID:      request.ID,
+					Result:  json.RawMessage(`"test"`),
+				}); err != nil {
+					http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+					return
+				}
+				return
+			}
+		}
+
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	})
+
+	testServer := httptest.NewServer(handler)
+	defer testServer.Close()
+
+	// Parse test server URL to get the actual host
+	serverURL, _ := url.Parse(testServer.URL)
+	actualHost := serverURL.Host
+
+	t.Run("Default Host (no override)", func(t *testing.T) {
+		capturedHost = ""
+		trans, err := NewStreamableHTTP(testServer.URL)
+		require.NoError(t, err)
+		defer trans.Close()
+
+		ctx := t.Context()
+		err = trans.Start(ctx)
+		require.NoError(t, err)
+
+		// Send a request to trigger Host header capture
+		request := JSONRPCRequest{
+			JSONRPC: "2.0",
+			ID:      mcp.NewRequestId(int64(1)),
+			Method:  "test",
+		}
+
+		_, err = trans.SendRequest(ctx, request)
+		require.NoError(t, err)
+
+		// Host should match the actual server host
+		mu.Lock()
+		require.Equal(t, actualHost, capturedHost)
+		mu.Unlock()
+	})
+
+	t.Run("Custom Host override", func(t *testing.T) {
+		capturedHost = ""
+		customHost := "api.example.com"
+
+		trans, err := NewStreamableHTTP(testServer.URL, WithStreamableHTTPHost(customHost))
+		require.NoError(t, err)
+		defer trans.Close()
+
+		ctx := t.Context()
+		err = trans.Start(ctx)
+		require.NoError(t, err)
+
+		// Send a request to trigger Host header capture
+		request := JSONRPCRequest{
+			JSONRPC: "2.0",
+			ID:      mcp.NewRequestId(int64(2)),
+			Method:  "test",
+		}
+
+		_, err = trans.SendRequest(ctx, request)
+		require.NoError(t, err)
+
+		// Host should be the custom host, not the actual server host
+		mu.Lock()
+		require.Equal(t, customHost, capturedHost)
+		require.NotEqual(t, actualHost, capturedHost)
+		mu.Unlock()
+	})
+
+	t.Run("Custom Host with port", func(t *testing.T) {
+		capturedHost = ""
+		customHost := "backend.internal.com:8443"
+
+		trans, err := NewStreamableHTTP(testServer.URL, WithStreamableHTTPHost(customHost))
+		require.NoError(t, err)
+		defer trans.Close()
+
+		ctx := t.Context()
+		err = trans.Start(ctx)
+		require.NoError(t, err)
+
+		// Send a request to trigger Host header capture
+		request := JSONRPCRequest{
+			JSONRPC: "2.0",
+			ID:      mcp.NewRequestId(int64(3)),
+			Method:  "test",
+		}
+
+		_, err = trans.SendRequest(ctx, request)
+		require.NoError(t, err)
+
+		// Host should be the custom host with port
+		mu.Lock()
+		require.Equal(t, customHost, capturedHost)
+		mu.Unlock()
+	})
+}
+
+// startMockStatelessSSEServer starts a server that mimics a stateless MCP server
+// (e.g. Python FastMCP with stateless_http=True) which responds to POST requests with text/event-stream SSE containing
+// a single event, but keeps the HTTP stream open (no EOF). GET requests return 200
+// with an SSE stream that never sends any data, simulating the listenForever hang.
+func startMockStatelessSSEServer() (string, func()) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			// Stateless server: accept GET SSE but never send data (stream hangs)
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			// Block until client disconnects
+			<-r.Context().Done()
+			return
+		}
+
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+
+		method, _ := request["method"].(string)
+
+		if method == "notifications/initialized" {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+
+		// Respond with SSE (text/event-stream), send the event, but keep stream open.
+		// This simulates servers that use stateless_http=True without json_response=True.
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+			return
+		}
+
+		var response map[string]any
+		if method == "initialize" {
+			response = map[string]any{
+				"jsonrpc": "2.0",
+				"id":      request["id"],
+				"result": map[string]any{
+					"protocolVersion": "2025-03-26",
+					"capabilities":    map[string]any{},
+					"serverInfo":      map[string]any{"name": "test-stateless", "version": "1.0"},
+				},
+			}
+		} else {
+			response = map[string]any{
+				"jsonrpc": "2.0",
+				"id":      request["id"],
+				"result":  map[string]any{"data": "ok"},
+			}
+		}
+
+		responseData, _ := json.Marshal(response)
+		fmt.Fprintf(w, "event: message\ndata: %s\n\n", responseData)
+		flusher.Flush()
+
+		// Keep the stream open — do NOT return. This is the key behavior that
+		// causes hangs if readSSE is not context-aware, because ReadString('\n')
+		// blocks indefinitely waiting for more data that never arrives.
+		<-r.Context().Done()
+	})
+
+	testServer := httptest.NewServer(handler)
+	return testServer.URL, testServer.Close
+}
+
+// TestReadSSEContextCancellation verifies that readSSE exits promptly when the
+// context is cancelled, even if the underlying reader is blocked on I/O.
+// This is a regression test for the hang caused by blocking ReadString calls
+// that ignored context cancellation.
+func TestReadSSEContextCancellation(t *testing.T) {
+	// Create a pipe where the writer never writes (simulates idle SSE stream)
+	pr, pw := io.Pipe()
+	defer pw.Close()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	c := &StreamableHTTP{}
+
+	handlerCalled := make(chan struct{}, 1)
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		c.readSSE(ctx, pr, func(event, data string) {
+			handlerCalled <- struct{}{}
+		})
+	}()
+
+	// readSSE should be blocked on ReadString — cancel the context
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	// readSSE must exit within 1 second after cancellation
+	select {
+	case <-done:
+		// Success — readSSE exited promptly
+	case <-time.After(2 * time.Second):
+		t.Fatal("readSSE did not exit within 2 seconds after context cancellation — blocking I/O is not interrupted")
+	}
+
+	select {
+	case <-handlerCalled:
+		t.Fatal("handler should not have been called on an idle stream")
+	default:
+	}
+}
+
+// TestSendRequestSSEStreamStaysOpen verifies that SendRequest returns the response
+// promptly even when the server sends an SSE response and keeps the HTTP stream open.
+// This reproduces the exact hang seen with stateless MCP servers (e.g. Python FastMCP) that
+// respond with text/event-stream but never close the connection.
+func TestSendRequestSSEStreamStaysOpen(t *testing.T) {
+	serverURL, closeServer := startMockStatelessSSEServer()
+	defer closeServer()
+
+	trans, err := NewStreamableHTTP(serverURL)
+	require.NoError(t, err)
+	defer trans.Close()
+
+	err = trans.Start(t.Context())
+	require.NoError(t, err)
+
+	// Initialize — server responds with SSE event but keeps stream open
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	initReq := JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      mcp.NewRequestId(int64(1)),
+		Method:  "initialize",
+	}
+
+	resp, err := trans.SendRequest(ctx, initReq)
+	require.NoError(t, err, "Initialize should not hang even though SSE stream stays open")
+	require.NotNil(t, resp)
+
+	// Send a second request (simulates ListTools after Initialize) — this is the
+	// request that hangs in production because readSSE from the first request's
+	// goroutine or the listenForever GET SSE interferes.
+	echoReq := JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      mcp.NewRequestId(int64(2)),
+		Method:  "tools/list",
+	}
+
+	resp2, err := trans.SendRequest(ctx, echoReq)
+	require.NoError(t, err, "Second request should not hang even though SSE streams stay open")
+	require.NotNil(t, resp2)
+}
+
+// TestContinuousListeningGoroutineExitsOnContextCancel verifies that the goroutine
+// spawned by WithContinuousListening exits when the context passed to Start() is
+// cancelled, even if Initialize never succeeds.
+func TestContinuousListeningGoroutineExitsOnContextCancel(t *testing.T) {
+	origRetryInterval := retryInterval
+	retryInterval = 10 * time.Millisecond
+	t.Cleanup(func() { retryInterval = origRetryInterval })
+
+	// Server that always rejects requests, so Initialize never succeeds.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"jsonrpc":"2.0","id":"1","error":{"code":-32600,"message":"Bad Request"}}`, http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	const cycles = 5
+	before := runtime.NumGoroutine()
+
+	for range cycles {
+		trans, err := NewStreamableHTTP(srv.URL, WithContinuousListening())
+		require.NoError(t, err)
+
+		startCtx, cancel := context.WithCancel(t.Context())
+
+		err = trans.Start(startCtx)
+		require.NoError(t, err)
+
+		// Attempt Initialize — it will fail because the server returns 400.
+		initReq := JSONRPCRequest{
+			JSONRPC: "2.0",
+			ID:      mcp.NewRequestId(int64(1)),
+			Method:  "initialize",
+		}
+		_, err = trans.SendRequest(startCtx, initReq)
+		require.Error(t, err)
+
+		// Cancel the context. This should be sufficient to release the goroutine
+		// spawned in Start(), without requiring an explicit Close() call.
+		cancel()
+	}
+
+	// Poll until goroutines settle, to avoid a flaky single-snapshot check.
+	allowed := 1
+	require.Eventually(t, func() bool {
+		runtime.Gosched()
+		return runtime.NumGoroutine()-before <= allowed
+	}, 5*time.Second, 50*time.Millisecond, "goroutines leaked beyond allowed=%d (ran %d cycles)", allowed, cycles)
+}
+
+// TestSendRequestSSEStreamStaysOpenWithContinuousListening is the same as above but
+// with WithContinuousListening enabled — the GET SSE connection hangs forever on
+// a stateless server, and we verify it doesn't block POST requests.
+func TestSendRequestSSEStreamStaysOpenWithContinuousListening(t *testing.T) {
+	retryInterval = 10 * time.Millisecond
+	serverURL, closeServer := startMockStatelessSSEServer()
+	defer closeServer()
+
+	trans, err := NewStreamableHTTP(serverURL, WithContinuousListening())
+	require.NoError(t, err)
+	defer trans.Close()
+
+	err = trans.Start(t.Context())
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	// Initialize — triggers listenForever goroutine which opens a GET SSE
+	// that hangs forever against the stateless server
+	initReq := JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      mcp.NewRequestId(int64(1)),
+		Method:  "initialize",
+	}
+
+	resp, err := trans.SendRequest(ctx, initReq)
+	require.NoError(t, err, "Initialize should succeed despite stateless SSE server")
+	require.NotNil(t, resp)
+
+	// Give listenForever time to start the GET SSE connection
+	time.Sleep(100 * time.Millisecond)
+
+	// Send tools/list — must not hang even though GET SSE stream is blocking
+	listReq := JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      mcp.NewRequestId(int64(2)),
+		Method:  "tools/list",
+	}
+
+	resp2, err := trans.SendRequest(ctx, listReq)
+	require.NoError(t, err, "tools/list should not hang even with continuous listening against stateless server")
+	require.NotNil(t, resp2)
 }

@@ -15,7 +15,7 @@ import (
 
 func TestHTTPClient(t *testing.T) {
 	hooks := &server.Hooks{}
-	hooks.AddAfterCallTool(func(ctx context.Context, id any, message *mcp.CallToolRequest, result *mcp.CallToolResult) {
+	hooks.AddAfterCallTool(func(ctx context.Context, id any, message *mcp.CallToolRequest, result any) {
 		clientSession := server.ClientSessionFromContext(ctx)
 		// wait until all the notifications are handled
 		for len(clientSession.NotificationChannel()) > 0 {
@@ -104,7 +104,7 @@ func TestHTTPClient(t *testing.T) {
 			notificationNum.Increment(notification.Method)
 		})
 
-		ctx := context.Background()
+		ctx := t.Context()
 
 		if err := client.Start(ctx); err != nil {
 			t.Fatalf("Failed to start client: %v", err)
@@ -162,7 +162,7 @@ func TestHTTPClient(t *testing.T) {
 				notificationNum.Increment(notification.Method)
 			})
 
-			ctx := context.Background()
+			ctx := t.Context()
 
 			if err := client.Start(ctx); err != nil {
 				t.Fatalf("Failed to start client: %v", err)

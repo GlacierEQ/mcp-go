@@ -3,16 +3,19 @@ package mcptest_test
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 
+	"github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/mcptest"
 	"github.com/mark3labs/mcp-go/server"
 )
 
 func TestServerWithTool(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	srv, err := mcptest.NewServer(t, server.ServerTool{
 		Tool: mcp.NewTool("hello",
@@ -79,7 +82,7 @@ func resultToString(result *mcp.CallToolResult) (string, error) {
 }
 
 func TestServerWithToolStructuredContent(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	srv, err := mcptest.NewServer(t, server.ServerTool{
 		Tool: mcp.NewTool("get_user",
@@ -168,7 +171,7 @@ func structuredContentHandler(ctx context.Context, request mcp.CallToolRequest) 
 }
 
 func TestServerWithPrompt(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	srv := mcptest.NewUnstartedServer(t)
 	defer srv.Close()
@@ -229,7 +232,7 @@ func TestServerWithPrompt(t *testing.T) {
 }
 
 func TestServerWithResource(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	srv := mcptest.NewUnstartedServer(t)
 	defer srv.Close()
@@ -278,7 +281,7 @@ func TestServerWithResource(t *testing.T) {
 }
 
 func TestServerWithResourceTemplate(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	srv := mcptest.NewUnstartedServer(t)
 	defer srv.Close()
@@ -350,5 +353,256 @@ func TestServerWithResourceTemplate(t *testing.T) {
 	want := "Document readme.txt for user john"
 	if textContent.Text != want {
 		t.Errorf("Got %q, want %q", textContent.Text, want)
+	}
+}
+
+func TestListToolsWithHeader(t *testing.T) {
+	expectedHeaderValue := "test-header-value"
+	gotHeaderValue := ""
+
+	hooks := &server.Hooks{}
+	hooks.AddAfterListTools(func(ctx context.Context, id any, message *mcp.ListToolsRequest, result *mcp.ListToolsResult) {
+		gotHeaderValue = message.Header.Get("X-Test-Header")
+	})
+
+	// Create MCP server with capabilities
+	mcpServer := server.NewMCPServer(
+		"test-server",
+		"1.0.0",
+		server.WithToolCapabilities(true),
+		server.WithHooks(hooks),
+	)
+
+	testServer := server.NewTestStreamableHTTPServer(mcpServer)
+	defer testServer.Close()
+
+	initRequest := mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+			ClientInfo: mcp.Implementation{
+				Name:    "test-client",
+				Version: "1.0.0",
+			},
+		},
+	}
+
+	client, err := client.NewStreamableHttpClient(testServer.URL)
+	if err != nil {
+		t.Fatalf("Create client failed %v", err)
+		return
+	}
+	ctx := t.Context()
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("Failed to start client: %v", err)
+		return
+	}
+
+	// Initialize
+	_, err = client.Initialize(ctx, initRequest)
+	if err != nil {
+		t.Fatalf("Failed to initialize: %v\n", err)
+	}
+
+	req := mcp.ListToolsRequest{Header: http.Header{"X-Test-Header": {expectedHeaderValue}}}
+	_, err = client.ListToolsByPage(t.Context(), req)
+	if err != nil {
+		t.Fatalf("Failed to ListTools: %v\n", err)
+	}
+	if expectedHeaderValue != gotHeaderValue {
+		t.Fatalf("Expected value is %s, got %s", expectedHeaderValue, gotHeaderValue)
+	}
+}
+
+func TestServerWithHooks(t *testing.T) {
+	ctx := t.Context()
+
+	var callCount atomic.Int32
+	hooks := &server.Hooks{}
+	hooks.AddBeforeCallTool(func(ctx context.Context, id any, request *mcp.CallToolRequest) {
+		callCount.Add(1)
+	})
+
+	srv := mcptest.NewUnstartedServer(t)
+	defer srv.Close()
+
+	srv.AddTool(mcp.NewTool("greet",
+		mcp.WithDescription("Says hello."),
+		mcp.WithString("name", mcp.Description("Name to greet.")),
+	), helloWorldHandler)
+
+	srv.AddServerOptions(server.WithHooks(hooks))
+
+	if err := srv.Start(ctx); err != nil {
+		t.Fatal("Start:", err)
+	}
+
+	var req mcp.CallToolRequest
+	req.Params.Name = "greet"
+	req.Params.Arguments = map[string]any{"name": "World"}
+
+	result, err := srv.Client().CallTool(ctx, req)
+	if err != nil {
+		t.Fatal("CallTool:", err)
+	}
+
+	got, err := resultToString(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "Hello, World!" {
+		t.Errorf("Got %q, want %q", got, "Hello, World!")
+	}
+
+	if n := callCount.Load(); n != 1 {
+		t.Errorf("Expected hook to be called 1 time, got %d", n)
+	}
+}
+
+func TestServerWithToolFilter(t *testing.T) {
+	ctx := t.Context()
+
+	srv := mcptest.NewUnstartedServer(t)
+	defer srv.Close()
+
+	srv.AddTools(
+		server.ServerTool{
+			Tool:    mcp.NewTool("visible_tool", mcp.WithDescription("This tool is visible.")),
+			Handler: helloWorldHandler,
+		},
+		server.ServerTool{
+			Tool:    mcp.NewTool("hidden_tool", mcp.WithDescription("This tool is hidden.")),
+			Handler: helloWorldHandler,
+		},
+	)
+
+	// Filter out tools whose name starts with "hidden_".
+	srv.AddServerOptions(
+		server.WithToolCapabilities(false),
+		server.WithToolFilter(func(ctx context.Context, tools []mcp.Tool) []mcp.Tool {
+			var filtered []mcp.Tool
+			for _, tool := range tools {
+				if !strings.HasPrefix(tool.Name, "hidden_") {
+					filtered = append(filtered, tool)
+				}
+			}
+			return filtered
+		}),
+	)
+
+	if err := srv.Start(ctx); err != nil {
+		t.Fatal("Start:", err)
+	}
+
+	result, err := srv.Client().ListTools(ctx, mcp.ListToolsRequest{})
+	if err != nil {
+		t.Fatal("ListTools:", err)
+	}
+
+	if len(result.Tools) != 1 {
+		t.Fatalf("Expected 1 tool, got %d", len(result.Tools))
+	}
+	if result.Tools[0].Name != "visible_tool" {
+		t.Errorf("Expected tool name %q, got %q", "visible_tool", result.Tools[0].Name)
+	}
+}
+
+func TestServerWithToolHandlerMiddleware(t *testing.T) {
+	ctx := t.Context()
+
+	srv := mcptest.NewUnstartedServer(t)
+	defer srv.Close()
+
+	srv.AddTool(mcp.NewTool("echo",
+		mcp.WithDescription("Echoes input."),
+		mcp.WithString("msg", mcp.Description("Message to echo.")),
+	), func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		msg, _ := request.RequireString("msg")
+		return mcp.NewToolResultText(msg), nil
+	})
+
+	// Middleware that prefixes the result with "[middleware] ".
+	srv.AddServerOptions(
+		server.WithToolHandlerMiddleware(func(next server.ToolHandlerFunc) server.ToolHandlerFunc {
+			return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+				result, err := next(ctx, request)
+				if err != nil {
+					return result, err
+				}
+				for i, content := range result.Content {
+					if tc, ok := content.(mcp.TextContent); ok {
+						tc.Text = "[middleware] " + tc.Text
+						result.Content[i] = tc
+					}
+				}
+				return result, nil
+			}
+		}),
+	)
+
+	if err := srv.Start(ctx); err != nil {
+		t.Fatal("Start:", err)
+	}
+
+	var req mcp.CallToolRequest
+	req.Params.Name = "echo"
+	req.Params.Arguments = map[string]any{"msg": "hello"}
+
+	result, err := srv.Client().CallTool(ctx, req)
+	if err != nil {
+		t.Fatal("CallTool:", err)
+	}
+
+	got, err := resultToString(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := "[middleware] hello"
+	if got != want {
+		t.Errorf("Got %q, want %q", got, want)
+	}
+}
+
+func TestSimulateClientInfo(t *testing.T) {
+	ctx := t.Context()
+
+	srv := mcptest.NewUnstartedServer(t)
+	defer srv.Close()
+	srv.AddTool(mcp.NewTool("whoami", mcp.WithDescription("Says hello to client.")),
+		func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			clientName := ""
+			if clientSession := server.ClientSessionFromContext(ctx); clientSession != nil {
+				if sessionWithClientInfo, ok := clientSession.(server.SessionWithClientInfo); ok {
+					clientName = sessionWithClientInfo.GetClientInfo().Name
+				}
+			}
+			return mcp.NewToolResultText(fmt.Sprintf("Hello, %s!", clientName)), nil
+		})
+	srv.SetClientInfo(mcp.Implementation{
+		Name: "test-client",
+	})
+	err := srv.Start(ctx)
+	if err != nil {
+		t.Fatal("Start:", err)
+	}
+
+	client := srv.Client()
+
+	var req mcp.CallToolRequest
+	req.Params.Name = "whoami"
+
+	result, err := client.CallTool(ctx, req)
+	if err != nil {
+		t.Fatal("CallTool:", err)
+	}
+
+	got, err := resultToString(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := "Hello, test-client!"
+	if got != want {
+		t.Errorf("Got %q, want %q", got, want)
 	}
 }

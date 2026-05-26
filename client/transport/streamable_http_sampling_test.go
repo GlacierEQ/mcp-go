@@ -54,7 +54,7 @@ func TestStreamableHTTP_SamplingFlow(t *testing.T) {
 	})
 
 	// Start the client
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
 	err = client.Start(ctx)
@@ -141,7 +141,7 @@ func TestStreamableHTTP_SamplingErrorHandling(t *testing.T) {
 	})
 
 	// Start the client
-	ctx := context.Background()
+	ctx := t.Context()
 	err = client.Start(ctx)
 	if err != nil {
 		t.Fatalf("Failed to start client: %v", err)
@@ -200,7 +200,7 @@ func TestStreamableHTTP_NoSamplingHandler(t *testing.T) {
 
 	// Don't set any request handler
 
-	ctx := context.Background()
+	ctx := t.Context()
 	err = client.Start(ctx)
 	if err != nil {
 		t.Fatalf("Failed to start client: %v", err)
@@ -254,7 +254,7 @@ func TestStreamableHTTP_BidirectionalInterface(t *testing.T) {
 	})
 
 	// Verify handler was set by triggering it
-	ctx := context.Background()
+	ctx := t.Context()
 	client.handleIncomingRequest(ctx, JSONRPCRequest{
 		JSONRPC: "2.0",
 		ID:      mcp.NewRequestId(1),
@@ -360,7 +360,7 @@ func TestStreamableHTTP_ConcurrentSamplingRequests(t *testing.T) {
 	})
 
 	// Start the client
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
 	err = client.Start(ctx)
@@ -408,7 +408,7 @@ func TestStreamableHTTP_ConcurrentSamplingRequests(t *testing.T) {
 	go client.handleIncomingRequest(ctx, request2)
 
 	// Wait for both responses to complete
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		select {
 		case <-responseComplete:
 			// Response received

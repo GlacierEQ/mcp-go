@@ -24,6 +24,8 @@ type Server struct {
 	prompts           []server.ServerPrompt
 	resources         []server.ServerResource
 	resourceTemplates []server.ServerResourceTemplate
+	serverOpts        []server.ServerOption
+	clientInfo        mcp.Implementation
 
 	cancel func()
 
@@ -41,12 +43,13 @@ type Server struct {
 }
 
 // NewServer starts a new MCP server with the provided tools and returns the server instance.
+// The server's lifetime is managed by Close(), not by the test context, so it can be
+// safely created in setup helpers and used across multiple subtests.
 func NewServer(t *testing.T, tools ...server.ServerTool) (*Server, error) {
 	server := NewUnstartedServer(t)
 	server.AddTools(tools...)
 
-	// TODO: use t.Context() once go.mod is upgraded to go 1.24+
-	if err := server.Start(context.TODO()); err != nil {
+	if err := server.Start(t.Context()); err != nil {
 		return nil, err
 	}
 
@@ -120,6 +123,18 @@ func (s *Server) AddResourceTemplates(templates ...server.ServerResourceTemplate
 	s.resourceTemplates = append(s.resourceTemplates, templates...)
 }
 
+// AddServerOptions adds server options to an unstarted server.
+// These options are passed to server.NewMCPServer when the server is started,
+// allowing configuration of hooks, middleware, tool filters, and other server settings.
+func (s *Server) AddServerOptions(opts ...server.ServerOption) {
+	s.serverOpts = append(s.serverOpts, opts...)
+}
+
+// SetClientInfo sets the client info for the test client.
+func (s *Server) SetClientInfo(info mcp.Implementation) {
+	s.clientInfo = info
+}
+
 // Start starts the server in a goroutine. Make sure to defer Close() after Start().
 // When using NewServer(), the returned server is already started.
 func (s *Server) Start(ctx context.Context) error {
@@ -131,7 +146,7 @@ func (s *Server) Start(ctx context.Context) error {
 	go func() {
 		defer s.wg.Done()
 
-		mcpServer := server.NewMCPServer(s.name, "1.0.0")
+		mcpServer := server.NewMCPServer(s.name, "1.0.0", s.serverOpts...)
 
 		mcpServer.AddTools(s.tools...)
 		mcpServer.AddPrompts(s.prompts...)
@@ -157,6 +172,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 	var initReq mcp.InitializeRequest
 	initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+	initReq.Params.ClientInfo = s.clientInfo
 	if _, err := s.client.Initialize(ctx, initReq); err != nil {
 		return fmt.Errorf("client.Initialize(): %w", err)
 	}

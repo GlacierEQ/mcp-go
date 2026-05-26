@@ -121,7 +121,7 @@ func TestSSEServer(t *testing.T) {
 		var wg sync.WaitGroup
 		wg.Add(numSessions)
 
-		for i := 0; i < numSessions; i++ {
+		for i := range numSessions {
 			go func(sessionNum int) {
 				defer wg.Done()
 
@@ -259,7 +259,7 @@ func TestSSEServer(t *testing.T) {
 		}
 
 		// Test SSE endpoint with proper cleanup
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 
 		req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/sse", ts.URL), nil)
@@ -308,7 +308,7 @@ func TestSSEServer(t *testing.T) {
 		ts := httptest.NewServer(middleware(sseServer))
 		defer ts.Close()
 
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 
 		req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/sse", ts.URL), nil)
@@ -355,7 +355,7 @@ func TestSSEServer(t *testing.T) {
 
 		sseServer.baseURL = ts.URL + "/mcp"
 
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 
 		req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/mcp/sse", ts.URL), nil)
@@ -427,7 +427,7 @@ func TestSSEServer(t *testing.T) {
 
 		sseServer.baseURL = ts.URL + "/mcp"
 		sseServer.useFullURLForMessageEndpoint = false
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 
 		req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/sse", sseServer.baseURL), nil)
@@ -516,7 +516,7 @@ func TestSSEServer(t *testing.T) {
 		}
 
 		// Test SSE endpoint with proper cleanup
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 
 		sseURL := fmt.Sprintf("%s/sse", ts.URL+sseServer.basePath)
@@ -725,10 +725,10 @@ func TestSSEServer(t *testing.T) {
 			WithSSEEndpoint(sseEndpoint),
 			WithHTTPServer(srv),
 		}
-		for i := 0; i < 100; i++ {
+		for range 100 {
 
 			var options []SSEOption
-			for i2 := 0; i2 < 100; i2++ {
+			for range 100 {
 				index := rand.Intn(len(rands))
 				options = append(options, rands[index])
 			}
@@ -1205,7 +1205,7 @@ func TestSSEServer(t *testing.T) {
 
 		// Test concurrent access
 		var wg sync.WaitGroup
-		for i := 0; i < 10; i++ {
+		for i := range 10 {
 			wg.Add(2)
 			go func(i int) {
 				defer wg.Done()
@@ -1383,7 +1383,7 @@ func TestSSEServer(t *testing.T) {
 		requestBody, err := json.Marshal(messageRequest)
 		require.NoError(t, err, "Failed to marshal request")
 
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(t.Context())
 		req, err := http.NewRequestWithContext(ctx, "POST", messageURL, bytes.NewBuffer(requestBody))
 		require.NoError(t, err, "Failed to create request")
 		req.Header.Set("Content-Type", "application/json")
@@ -1427,7 +1427,7 @@ func TestSSEServer(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 
 		shutdownDone := make(chan error, 1)
-		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
 		defer cancel()
 		go func() {
 			err := sseServer.Shutdown(ctx)
@@ -1447,7 +1447,7 @@ func TestSSEServer(t *testing.T) {
 	t.Run("Headers are passed through to tool requests", func(t *testing.T) {
 		hooks := &Hooks{}
 		headerVerified := make(chan struct{})
-		hooks.AddAfterCallTool(func(ctx context.Context, id any, message *mcp.CallToolRequest, result *mcp.CallToolResult) {
+		hooks.AddAfterCallTool(func(ctx context.Context, id any, message *mcp.CallToolRequest, result any) {
 			if message.Params.Name == "verify-headers" {
 				select {
 				case <-headerVerified:
@@ -1521,7 +1521,7 @@ func TestSSEServer(t *testing.T) {
 	t.Run("Headers are not nil when no headers are set", func(t *testing.T) {
 		hooks := &Hooks{}
 		headersChecked := make(chan struct{})
-		hooks.AddAfterCallTool(func(ctx context.Context, id any, message *mcp.CallToolRequest, result *mcp.CallToolResult) {
+		hooks.AddAfterCallTool(func(ctx context.Context, id any, message *mcp.CallToolRequest, result any) {
 			if message.Params.Name == "check-headers-not-nil" {
 				select {
 				case <-headersChecked:
@@ -1615,6 +1615,109 @@ func readSSEEvent(sseResp *http.Response) (string, error) {
 		return "", err
 	}
 	return string(buf[:n]), nil
+}
+
+func TestSSEServer_CloseSessions(t *testing.T) {
+	mcpServer := NewMCPServer("test", "1.0.0")
+	sseServer := NewSSEServer(mcpServer, WithBaseURL("http://localhost:0"))
+
+	ts := httptest.NewServer(sseServer)
+	defer ts.Close()
+	sseServer.baseURL = ts.URL
+
+	// Connect a client to the SSE endpoint.
+	sseResp, err := http.Get(ts.URL + "/sse")
+	if err != nil {
+		t.Fatalf("Failed to connect to SSE endpoint: %v", err)
+	}
+	defer sseResp.Body.Close()
+
+	// Read the initial endpoint event to confirm we're connected.
+	endpointEvent, err := readSSEEvent(sseResp)
+	if err != nil {
+		t.Fatalf("Failed to read endpoint event: %v", err)
+	}
+	if !strings.Contains(endpointEvent, "event: endpoint") {
+		t.Fatalf("Expected endpoint event, got: %s", endpointEvent)
+	}
+
+	// Verify at least one session exists.
+	sessionCount := 0
+	sseServer.sessions.Range(func(_, _ any) bool {
+		sessionCount++
+		return true
+	})
+	if sessionCount == 0 {
+		t.Fatal("Expected at least one active session")
+	}
+
+	// Close all sessions without stopping the HTTP server.
+	sseServer.CloseSessions()
+
+	// Verify sessions are cleaned up.
+	sessionCount = 0
+	sseServer.sessions.Range(func(_, _ any) bool {
+		sessionCount++
+		return true
+	})
+	if sessionCount != 0 {
+		t.Fatalf("Expected 0 sessions after CloseSessions, got %d", sessionCount)
+	}
+
+	// Verify the HTTP server is still running by connecting a new client.
+	sseResp2, err := http.Get(ts.URL + "/sse")
+	if err != nil {
+		t.Fatalf("HTTP server should still be running after CloseSessions: %v", err)
+	}
+	defer sseResp2.Body.Close()
+
+	endpointEvent2, err := readSSEEvent(sseResp2)
+	if err != nil {
+		t.Fatalf("Failed to read endpoint event from new connection: %v", err)
+	}
+	if !strings.Contains(endpointEvent2, "event: endpoint") {
+		t.Fatalf("Expected endpoint event on new connection, got: %s", endpointEvent2)
+	}
+}
+
+func TestSSEServer_CloseSessionsConcurrent(t *testing.T) {
+	mcpServer := NewMCPServer("test", "1.0.0")
+	sseServer := NewSSEServer(mcpServer, WithBaseURL("http://localhost:0"))
+
+	ts := httptest.NewServer(sseServer)
+	defer ts.Close()
+	sseServer.baseURL = ts.URL
+
+	// Connect a client.
+	sseResp, err := http.Get(ts.URL + "/sse")
+	if err != nil {
+		t.Fatalf("Failed to connect to SSE endpoint: %v", err)
+	}
+	defer sseResp.Body.Close()
+
+	_, err = readSSEEvent(sseResp)
+	if err != nil {
+		t.Fatalf("Failed to read endpoint event: %v", err)
+	}
+
+	// Call CloseSessions concurrently to verify no double-close panic.
+	var wg sync.WaitGroup
+	for range 100 {
+		wg.Go(func() {
+			sseServer.CloseSessions()
+		})
+	}
+	wg.Wait()
+
+	// Sessions should be cleaned up regardless of which call ran first.
+	count := 0
+	sseServer.sessions.Range(func(_, _ any) bool {
+		count++
+		return true
+	})
+	if count != 0 {
+		t.Fatalf("Expected 0 sessions after concurrent CloseSessions, got %d", count)
+	}
 }
 
 // addHeaderVerificationTool adds a tool that verifies HTTP headers are passed correctly

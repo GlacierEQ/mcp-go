@@ -1,11 +1,16 @@
 package mcp
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestToolWithBothSchemasError verifies that there will be feedback if the
@@ -144,6 +149,58 @@ func TestUnmarshalToolWithoutRawSchema(t *testing.T) {
 	assert.Empty(t, toolUnmarshalled.RawInputSchema)
 }
 
+func TestToolWithStringInteger(t *testing.T) {
+	tool := NewTool("buy-item",
+		WithDescription("A tool for buying items"),
+		WithString("itemName",
+			Description("Name of the item to purchase"),
+			Required(),
+		),
+		WithInteger("itemCount",
+			Description("Number of copies of the item to purchase"),
+			Required(),
+			DefaultNumber(1),
+			Min(1),
+			Max(100),
+		),
+	)
+
+	data, err := json.Marshal(tool)
+	require.NoError(t, err)
+
+	var result map[string]any
+	err = json.Unmarshal(data, &result)
+	require.NoError(t, err)
+
+	assert.Equal(t, "buy-item", result["name"])
+	assert.Equal(t, "A tool for buying items", result["description"])
+
+	schema, ok := result["inputSchema"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "object", schema["type"])
+
+	properties, ok := schema["properties"].(map[string]any)
+	require.True(t, ok)
+
+	itemName, ok := properties["itemName"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "string", itemName["type"])
+	assert.Equal(t, "Name of the item to purchase", itemName["description"])
+
+	itemCount, ok := properties["itemCount"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "integer", itemCount["type"])
+	assert.Equal(t, "Number of copies of the item to purchase", itemCount["description"])
+	assert.Equal(t, float64(1), itemCount["default"])
+	assert.Equal(t, float64(1), itemCount["minimum"])
+	assert.Equal(t, float64(100), itemCount["maximum"])
+
+	required, ok := schema["required"].([]any)
+	require.True(t, ok)
+	assert.Contains(t, required, "itemName")
+	assert.Contains(t, required, "itemCount")
+}
+
 func TestToolWithObjectAndArray(t *testing.T) {
 	// Create a tool with both object and array properties
 	tool := NewTool("reading-list",
@@ -240,6 +297,108 @@ func TestToolWithObjectAndArray(t *testing.T) {
 	required, ok := schema["required"].([]any)
 	assert.True(t, ok)
 	assert.Contains(t, required, "books")
+}
+
+func TestToolWithAny(t *testing.T) {
+	const desc = "Can be any value: string, number, bool, object, or slice"
+
+	tool := NewTool("any-tool",
+		WithDescription("A tool with an 'any' type property"),
+		WithAny("data",
+			Description(desc),
+			Required(),
+		),
+	)
+
+	data, err := json.Marshal(tool)
+	assert.NoError(t, err)
+
+	var result map[string]any
+	err = json.Unmarshal(data, &result)
+	assert.NoError(t, err)
+
+	assert.Equal(t, "any-tool", result["name"])
+
+	schema, ok := result["inputSchema"].(map[string]any)
+	assert.True(t, ok)
+	assert.Equal(t, "object", schema["type"])
+
+	properties, ok := schema["properties"].(map[string]any)
+	assert.True(t, ok)
+
+	dataProp, ok := properties["data"].(map[string]any)
+	assert.True(t, ok)
+	_, typeExists := dataProp["type"]
+	assert.False(t, typeExists, "The 'any' type property should not have a 'type' field")
+	assert.Equal(t, desc, dataProp["description"])
+
+	required, ok := schema["required"].([]any)
+	assert.True(t, ok)
+	assert.Contains(t, required, "data")
+
+	type testStruct struct {
+		A string `json:"A"`
+	}
+	testCases := []struct {
+		description string
+		arg         any
+		expect      any
+	}{{
+		description: "string",
+		arg:         "hello world",
+		expect:      "hello world",
+	}, {
+		description: "integer",
+		arg:         123,
+		expect:      float64(123), // JSON unmarshals numbers to float64
+	}, {
+		description: "float",
+		arg:         3.14,
+		expect:      3.14,
+	}, {
+		description: "boolean",
+		arg:         true,
+		expect:      true,
+	}, {
+		description: "object",
+		arg:         map[string]any{"key": "value"},
+		expect:      map[string]any{"key": "value"},
+	}, {
+		description: "slice",
+		arg:         []any{1, "two", false},
+		expect:      []any{float64(1), "two", false},
+	}, {
+		description: "struct",
+		arg:         testStruct{A: "B"},
+		expect:      map[string]any{"A": "B"},
+	}}
+
+	for _, tc := range testCases {
+		t.Run(fmt.Sprintf("with_%s", tc.description), func(t *testing.T) {
+			req := CallToolRequest{
+				Request: Request{},
+				Params: CallToolParams{
+					Name: "any-tool",
+					Arguments: map[string]any{
+						"data": tc.arg,
+					},
+				},
+			}
+
+			// Marshal and unmarshal to simulate a real request
+			reqBytes, err := json.Marshal(req)
+			assert.NoError(t, err)
+
+			var unmarshaledReq CallToolRequest
+			err = json.Unmarshal(reqBytes, &unmarshaledReq)
+			assert.NoError(t, err)
+
+			args := unmarshaledReq.GetArguments()
+			value, ok := args["data"]
+			assert.True(t, ok)
+			assert.Equal(t, tc.expect, value)
+		})
+	}
 }
 
 func TestParseToolCallToolRequest(t *testing.T) {
@@ -532,9 +691,9 @@ func TestFlexibleArgumentsJSONMarshalUnmarshal(t *testing.T) {
 // generates an MCP-compatible JSON output schema for a tool
 func TestToolWithInputSchema(t *testing.T) {
 	type TestInput struct {
-		Name  string `json:"name" jsonschema_description:"Person's name" jsonschema:"required"`
-		Age   int    `json:"age" jsonschema_description:"Person's age"`
-		Email string `json:"email,omitempty" jsonschema_description:"Email address" jsonschema:"required"`
+		Name  string `json:"name" jsonschema:"Person's name"`
+		Age   int    `json:"age" jsonschema:"Person's age"`
+		Email string `json:"email,omitempty" jsonschema:"Email address"`
 	}
 
 	tool := NewTool("test_tool",
@@ -559,7 +718,7 @@ func TestToolWithInputSchema(t *testing.T) {
 	assert.NotNil(t, inputSchema)
 
 	// Verify required list exists
-	schemaMap, ok := inputSchema.(map[string]interface{})
+	schemaMap, ok := inputSchema.(map[string]any)
 	assert.True(t, ok)
 	requiredList, exists := schemaMap["required"]
 	assert.True(t, exists)
@@ -568,22 +727,91 @@ func TestToolWithInputSchema(t *testing.T) {
 	// Verify properties exist
 	properties, exists := schemaMap["properties"]
 	assert.True(t, exists)
-	propertiesMap, ok := properties.(map[string]interface{})
+	propertiesMap, ok := properties.(map[string]any)
 	assert.True(t, ok)
 
 	// Verify specific properties
 	assert.Contains(t, propertiesMap, "name")
 	assert.Contains(t, propertiesMap, "age")
 	assert.Contains(t, propertiesMap, "email")
+
+	// Verify schema type is "object"
+	assert.Equal(t, "object", schemaMap["type"])
+
+	// Verify required field contents: name and age required, email (omitempty) not required
+	requiredSlice, ok := requiredList.([]any)
+	assert.True(t, ok)
+	assert.Contains(t, requiredSlice, "name")
+	assert.Contains(t, requiredSlice, "age")
+	assert.NotContains(t, requiredSlice, "email")
+
+	// Verify field descriptions match jsonschema tag values
+	nameProp, ok := propertiesMap["name"].(map[string]any)
+	assert.True(t, ok)
+	assert.Equal(t, "Person's name", nameProp["description"])
+
+	ageProp, ok := propertiesMap["age"].(map[string]any)
+	assert.True(t, ok)
+	assert.Equal(t, "Person's age", ageProp["description"])
+
+	emailProp, ok := propertiesMap["email"].(map[string]any)
+	assert.True(t, ok)
+	assert.Equal(t, "Email address", emailProp["description"])
+
+	// Verify additionalProperties is false
+	assert.Equal(t, false, schemaMap["additionalProperties"])
+}
+
+// TestToolWithInputSchemaJsonSchemaTagError tests that the WithInputSchema
+// function prints an error to stderr if a jsonschema tag is invalid.
+func TestToolWithInputSchemaJsonSchemaTagError(t *testing.T) {
+	type TestInput struct {
+		Name  string `json:"name" jsonschema:"description=Person's name"` // Invalid jsonschema tag
+		Age   int    `json:"age" jsonschema:"Person's age"`
+		Email string `json:"email,omitempty" jsonschema:"Email address"`
+	}
+
+	var (
+		expectedStderrPrefix = "For[mcp.TestInput]():" // jsonschema.For[T] error prefix
+		buf                  bytes.Buffer
+		origStderr, r, w     *os.File
+		err                  error
+	)
+
+	// Redirect stderr
+	origStderr = os.Stderr
+	r, w, err = os.Pipe()
+	require.NoError(t, err)
+	os.Stderr = w
+
+	_ = NewTool("test_tool",
+		WithDescription("Test tool with input schema that has an invalid jsonschema tag"),
+		WithInputSchema[TestInput](),
+	)
+
+	// Restore stderr
+	err = w.Close()
+	require.NoError(t, err)
+	os.Stderr = origStderr
+
+	// Read stderr output into buffer
+	_, err = io.Copy(&buf, r)
+	require.NoError(t, err)
+	err = r.Close()
+	require.NoError(t, err)
+
+	if !strings.HasPrefix(buf.String(), expectedStderrPrefix) {
+		t.Errorf("expected stderr to have prefix %q, got %q", expectedStderrPrefix, buf.String())
+	}
 }
 
 // TestToolWithOutputSchema tests that the WithOutputSchema function
 // generates an MCP-compatible JSON output schema for a tool
 func TestToolWithOutputSchema(t *testing.T) {
 	type TestOutput struct {
-		Name  string `json:"name" jsonschema_description:"Person's name"`
-		Age   int    `json:"age" jsonschema_description:"Person's age"`
-		Email string `json:"email,omitempty" jsonschema_description:"Email address"`
+		Name  string `json:"name" jsonschema:"Person's name"`
+		Age   int    `json:"age" jsonschema:"Person's age"`
+		Email string `json:"email,omitempty" jsonschema:"Email address"`
 	}
 
 	tests := []struct {
@@ -625,11 +853,90 @@ func TestToolWithOutputSchema(t *testing.T) {
 			if tt.expectedOutputSchema {
 				assert.True(t, exists)
 				assert.NotNil(t, outputSchema)
+
+				outputSchemaMap, ok := outputSchema.(map[string]any)
+				assert.True(t, ok)
+
+				// Verify schema type is "object"
+				assert.Equal(t, "object", outputSchemaMap["type"])
+
+				// Verify properties exist
+				outputProps, ok := outputSchemaMap["properties"].(map[string]any)
+				assert.True(t, ok)
+				assert.Contains(t, outputProps, "name")
+				assert.Contains(t, outputProps, "age")
+				assert.Contains(t, outputProps, "email")
+
+				// Verify required field contents: name and age required, email (omitempty) not required
+				outputRequired, ok := outputSchemaMap["required"].([]any)
+				assert.True(t, ok)
+				assert.Contains(t, outputRequired, "name")
+				assert.Contains(t, outputRequired, "age")
+				assert.NotContains(t, outputRequired, "email")
+
+				// Verify field descriptions match jsonschema tag values
+				nameProp, ok := outputProps["name"].(map[string]any)
+				assert.True(t, ok)
+				assert.Equal(t, "Person's name", nameProp["description"])
+
+				ageProp, ok := outputProps["age"].(map[string]any)
+				assert.True(t, ok)
+				assert.Equal(t, "Person's age", ageProp["description"])
+
+				emailProp, ok := outputProps["email"].(map[string]any)
+				assert.True(t, ok)
+				assert.Equal(t, "Email address", emailProp["description"])
+
+				// Verify additionalProperties is false
+				assert.Equal(t, false, outputSchemaMap["additionalProperties"])
 			} else {
 				assert.False(t, exists)
 				assert.Nil(t, outputSchema)
 			}
 		})
+	}
+}
+
+// TestToolWithOutputSchemaJsonSchemaTagError tests that the WithOutputSchema
+// function prints an error to stderr if a jsonschema tag is invalid.
+func TestToolWithOutputSchemaJsonSchemaTagError(t *testing.T) {
+	type TestOutput struct {
+		Name  string `json:"name" jsonschema:"description=Person's name"` // Invalid jsonschema tag
+		Age   int    `json:"age" jsonschema:"Person's age"`
+		Email string `json:"email,omitempty" jsonschema:"Email address"`
+	}
+
+	var (
+		expectedStderrPrefix = "For[mcp.TestOutput]():" // jsonschema.For[T] error prefix
+		buf                  bytes.Buffer
+		origStderr, r, w     *os.File
+		err                  error
+	)
+
+	// Redirect stderr
+	origStderr = os.Stderr
+	r, w, err = os.Pipe()
+	require.NoError(t, err)
+	os.Stderr = w
+
+	_ = NewTool("test_tool",
+		WithDescription("Test tool with output schema that has an invalid jsonschema tag"),
+		WithOutputSchema[TestOutput](),
+	)
+
+	// Restore stderr
+	err = w.Close()
+	require.NoError(t, err)
+	os.Stderr = origStderr
+
+	// Read stderr output into buffer
+	_, err = io.Copy(&buf, r)
+	require.NoError(t, err)
+	err = r.Close()
+	require.NoError(t, err)
+
+	if !strings.HasPrefix(buf.String(), expectedStderrPrefix) {
+		t.Errorf("expected stderr to have prefix %q, got %q", expectedStderrPrefix, buf.String())
 	}
 }
 
@@ -1322,6 +1629,46 @@ func TestNewItemsAPICompatibility(t *testing.T) {
 			),
 		},
 		{
+			name: "WithIntegerItems basic",
+			oldTool: NewTool("old-integer-basic",
+				WithDescription("Tool with integer array using old API"),
+				WithArray("scores",
+					Description("List of scores"),
+					Items(map[string]any{
+						"type": "integer",
+					}),
+				),
+			),
+			newTool: NewTool("new-integer-basic",
+				WithDescription("Tool with integer array using new API"),
+				WithArray("scores",
+					Description("List of scores"),
+					WithIntegerItems(),
+				),
+			),
+		},
+		{
+			name: "WithIntegerItems with constraints",
+			oldTool: NewTool("old-integer-with-constraints",
+				WithDescription("Tool with constrained integer array using old API"),
+				WithArray("ratings",
+					Description("List of ratings"),
+					Items(map[string]any{
+						"type":    "integer",
+						"minimum": 0,
+						"maximum": 10,
+					}),
+				),
+			),
+			newTool: NewTool("new-integer-with-constraints",
+				WithDescription("Tool with constrained integer array using new API"),
+				WithArray("ratings",
+					Description("List of ratings"),
+					WithIntegerItems(Min(0), Max(10)),
+				),
+			),
+		},
+		{
 			name: "WithBooleanItems basic",
 			oldTool: NewTool("old-boolean-array",
 				WithDescription("Tool with boolean array using old API"),
@@ -1395,4 +1742,932 @@ func TestNewItemsAPICompatibility(t *testing.T) {
 			assert.Equal(t, oldArrayProp["type"], newArrayProp["type"], "Array types should match")
 		})
 	}
+}
+
+// TestToolMetaMarshaling tests that the Meta field is properly marshaled as _meta in JSON output
+func TestToolMetaMarshaling(t *testing.T) {
+	meta := map[string]any{"version": "1.0.0", "author": "test"}
+	// Marshal the tool to JSON
+	data, err := json.Marshal(Tool{
+		Name:        "test-tool",
+		Description: "A test tool with meta data",
+		Meta:        NewMetaFromMap(meta),
+		InputSchema: ToolInputSchema{
+			Type: "object",
+			Properties: map[string]any{
+				"input": map[string]any{
+					"type":        "string",
+					"description": "Test input",
+				},
+			},
+		},
+	})
+	assert.NoError(t, err)
+
+	// Unmarshal to map for comparison
+	var result map[string]any
+	err = json.Unmarshal(data, &result)
+	assert.NoError(t, err)
+
+	// Check if _meta field is present and correct
+	assert.Contains(t, result, "_meta", "Tool with Meta should include _meta field")
+	assert.Equal(t, meta, result["_meta"], "_meta field should match expected value")
+}
+
+func TestToolMetaMarshalingOmitsWhenNil(t *testing.T) {
+	// Marshal a tool without Meta
+	data, err := json.Marshal(Tool{
+		Name:        "test-tool-no-meta",
+		Description: "A test tool without meta data",
+		InputSchema: ToolInputSchema{
+			Type:       "object",
+			Properties: map[string]any{},
+		},
+	})
+	assert.NoError(t, err)
+
+	// Unmarshal to map
+	var result map[string]any
+	err = json.Unmarshal(data, &result)
+	assert.NoError(t, err)
+
+	// Check that _meta field is not present
+	assert.NotContains(t, result, "_meta", "Tool without Meta should not include _meta field")
+}
+
+func TestToolArgumentsSchema_UnmarshalWithDefinitions(t *testing.T) {
+	// Test that "definitions" (JSON Schema draft-07) is properly unmarshaled into Defs field
+	jsonData := `{
+		"type": "object",
+		"properties": {
+			"operation": {
+				"$ref": "#/definitions/operation_type"
+			}
+		},
+		"required": ["operation"],
+		"definitions": {
+			"operation_type": {
+				"type": "string",
+				"enum": ["create", "read", "update", "delete"]
+			}
+		}
+	}`
+
+	var schema ToolArgumentsSchema
+	err := json.Unmarshal([]byte(jsonData), &schema)
+	assert.NoError(t, err)
+
+	// Verify the schema was properly unmarshaled
+	assert.Equal(t, "object", schema.Type)
+	assert.Contains(t, schema.Properties, "operation")
+	assert.Equal(t, []string{"operation"}, schema.Required)
+
+	// Most importantly: verify that "definitions" was read into Defs field
+	assert.NotNil(t, schema.Defs)
+	assert.Contains(t, schema.Defs, "operation_type")
+
+	operationType, ok := schema.Defs["operation_type"].(map[string]any)
+	assert.True(t, ok)
+	assert.Equal(t, "string", operationType["type"])
+	assert.NotNil(t, operationType["enum"])
+}
+
+func TestToolArgumentsSchema_UnmarshalWithDefs(t *testing.T) {
+	// Test that "$defs" (JSON Schema 2019-09+) is properly unmarshaled into Defs field
+	jsonData := `{
+		"type": "object",
+		"properties": {
+			"operation": {
+				"$ref": "#/$defs/operation_type"
+			}
+		},
+		"required": ["operation"],
+		"$defs": {
+			"operation_type": {
+				"type": "string",
+				"enum": ["create", "read", "update", "delete"]
+			}
+		}
+	}`
+
+	var schema ToolArgumentsSchema
+	err := json.Unmarshal([]byte(jsonData), &schema)
+	assert.NoError(t, err)
+
+	// Verify the schema was properly unmarshaled
+	assert.Equal(t, "object", schema.Type)
+	assert.Contains(t, schema.Properties, "operation")
+	assert.Equal(t, []string{"operation"}, schema.Required)
+
+	// Verify that "$defs" was read into Defs field
+	assert.NotNil(t, schema.Defs)
+	assert.Contains(t, schema.Defs, "operation_type")
+
+	operationType, ok := schema.Defs["operation_type"].(map[string]any)
+	assert.True(t, ok)
+	assert.Equal(t, "string", operationType["type"])
+	assert.NotNil(t, operationType["enum"])
+}
+
+func TestToolArgumentsSchema_UnmarshalPrefersDefs(t *testing.T) {
+	// Test that if both "$defs" and "definitions" are present, "$defs" takes precedence
+	jsonData := `{
+		"type": "object",
+		"$defs": {
+			"from_defs": {
+				"type": "string"
+			}
+		},
+		"definitions": {
+			"from_definitions": {
+				"type": "integer"
+			}
+		}
+	}`
+
+	var schema ToolArgumentsSchema
+	err := json.Unmarshal([]byte(jsonData), &schema)
+	assert.NoError(t, err)
+
+	// $defs should take precedence
+	assert.Contains(t, schema.Defs, "from_defs")
+	assert.NotContains(t, schema.Defs, "from_definitions")
+}
+
+func TestToolArgumentsSchema_MarshalRoundTrip(t *testing.T) {
+	// Test that marshaling and unmarshaling preserves definitions
+	original := ToolArgumentsSchema{
+		Type: "object",
+		Properties: map[string]any{
+			"field": map[string]any{
+				"$ref": "#/$defs/my_type",
+			},
+		},
+		Required: []string{"field"},
+		Defs: map[string]any{
+			"my_type": map[string]any{
+				"type": "string",
+				"enum": []string{"a", "b", "c"},
+			},
+		},
+	}
+
+	// Marshal
+	data, err := json.Marshal(original)
+	assert.NoError(t, err)
+
+	// Unmarshal
+	var unmarshaled ToolArgumentsSchema
+	err = json.Unmarshal(data, &unmarshaled)
+	assert.NoError(t, err)
+
+	// Verify round-trip
+	assert.Equal(t, original.Type, unmarshaled.Type)
+	assert.Equal(t, original.Required, unmarshaled.Required)
+	assert.NotNil(t, unmarshaled.Defs)
+	assert.Contains(t, unmarshaled.Defs, "my_type")
+}
+
+func TestWithToolIcons(t *testing.T) {
+	tool := Tool{}
+	icons := []Icon{
+		{Src: "tool-icon.png", MIMEType: "image/png"},
+	}
+	opt := WithToolIcons(icons...)
+	opt(&tool)
+
+	assert.Equal(t, icons, tool.Icons)
+}
+
+func TestToolArgumentsSchema_UnmarshalWithAdditionalPropertiesFalse(t *testing.T) {
+	jsonData := `{
+		"type": "object",
+		"properties": {
+			"name": {"type": "string"}
+		},
+		"additionalProperties": false
+	}`
+
+	var schema ToolArgumentsSchema
+	err := json.Unmarshal([]byte(jsonData), &schema)
+	assert.NoError(t, err)
+
+	assert.Equal(t, "object", schema.Type)
+	assert.Contains(t, schema.Properties, "name")
+	assert.Equal(t, false, schema.AdditionalProperties)
+}
+
+func TestToolArgumentsSchema_UnmarshalWithAdditionalPropertiesSchema(t *testing.T) {
+	jsonData := `{
+		"type": "object",
+		"properties": {
+			"name": {"type": "string"}
+		},
+		"additionalProperties": {"type": "string"}
+	}`
+
+	var schema ToolArgumentsSchema
+	err := json.Unmarshal([]byte(jsonData), &schema)
+	assert.NoError(t, err)
+
+	assert.Equal(t, "object", schema.Type)
+	additionalProps, ok := schema.AdditionalProperties.(map[string]any)
+	assert.True(t, ok)
+	assert.Equal(t, "string", additionalProps["type"])
+}
+
+func TestToolArgumentsSchema_MarshalWithAdditionalProperties(t *testing.T) {
+	schema := ToolArgumentsSchema{
+		Type:                 "object",
+		AdditionalProperties: false,
+	}
+
+	data, err := json.Marshal(schema)
+	assert.NoError(t, err)
+	assert.Contains(t, string(data), `"additionalProperties":false`)
+}
+
+func TestToolArgumentsSchema_MarshalOmitsNilAdditionalProperties(t *testing.T) {
+	schema := ToolArgumentsSchema{
+		Type:                 "object",
+		AdditionalProperties: nil,
+	}
+
+	data, err := json.Marshal(schema)
+	assert.NoError(t, err)
+	assert.NotContains(t, string(data), "additionalProperties")
+}
+
+func TestWithSchemaAdditionalProperties(t *testing.T) {
+	tool := NewTool(
+		"strict-tool",
+		WithSchemaAdditionalProperties(false),
+	)
+
+	assert.Equal(t, false, tool.InputSchema.AdditionalProperties)
+
+	data, err := json.Marshal(tool)
+	assert.NoError(t, err)
+	assert.Contains(t, string(data), `"additionalProperties":false`)
+}
+
+func TestToolInputSchema_MarshalWithEmptyPropertiesAndRequired(t *testing.T) {
+	schema := ToolInputSchema{
+		Type: "object",
+	}
+	data, err := json.Marshal(schema)
+	assert.NoError(t, err)
+	assert.Contains(t, string(data), `"properties":{}`)
+	assert.Contains(t, string(data), `"required":[]`)
+
+	schema = ToolInputSchema{
+		Type:       "object",
+		Properties: nil,
+		Required:   nil,
+	}
+	data, err = json.Marshal(schema)
+	assert.NoError(t, err)
+	assert.Contains(t, string(data), `"properties":{}`)
+	assert.Contains(t, string(data), `"required":[]`)
+
+	schema = ToolInputSchema{
+		Type:       "object",
+		Properties: map[string]any{},
+		Required:   []string{},
+	}
+	data, err = json.Marshal(schema)
+	assert.NoError(t, err)
+	assert.Contains(t, string(data), `"properties":{}`)
+	assert.Contains(t, string(data), `"required":[]`)
+
+	schema = ToolInputSchema{
+		Type: "object",
+		Properties: map[string]any{
+			"query": "notEmpty=true",
+		},
+		Required: []string{"query"},
+	}
+	data, err = json.Marshal(schema)
+	assert.NoError(t, err)
+	assert.Contains(t, string(data), `"properties":{"query":"notEmpty=true"}`)
+	assert.Contains(t, string(data), `"required":["query"]`)
+}
+
+func TestToolOutputSchema_MarshalWithEmptyPropertiesAndRequired(t *testing.T) {
+	schemaOutput := ToolOutputSchema{
+		Type: "object",
+	}
+	data, err := json.Marshal(schemaOutput)
+	assert.NoError(t, err)
+	assert.Contains(t, string(data), `"properties":{}`)
+	assert.Contains(t, string(data), `"required":[]`)
+
+	schemaOutput = ToolOutputSchema{
+		Type:       "object",
+		Properties: nil,
+		Required:   nil,
+	}
+	data, err = json.Marshal(schemaOutput)
+	assert.NoError(t, err)
+	assert.Contains(t, string(data), `"properties":{}`)
+	assert.Contains(t, string(data), `"required":[]`)
+
+	schemaOutput = ToolOutputSchema{
+		Type:       "object",
+		Properties: map[string]any{},
+		Required:   []string{},
+	}
+	data, err = json.Marshal(schemaOutput)
+	assert.NoError(t, err)
+	assert.Contains(t, string(data), `"properties":{}`)
+	assert.Contains(t, string(data), `"required":[]`)
+
+	schemaOutput = ToolOutputSchema{
+		Type: "object",
+		Properties: map[string]any{
+			"query": "notEmpty=true",
+		},
+		Required: []string{"query"},
+	}
+	data, err = json.Marshal(schemaOutput)
+	assert.NoError(t, err)
+	assert.Contains(t, string(data), `"properties":{"query":"notEmpty=true"}`)
+	assert.Contains(t, string(data), `"required":["query"]`)
+}
+
+// TestToolWithNoParams_MarshalJSON_Issue690 verifies that a Tool created via NewTool without any parameters still produces valid JSON Schema with properties and required in inputSchema.
+func TestToolWithNoParams_MarshalJSON_Issue690(t *testing.T) {
+	tests := []struct {
+		name string
+		tool Tool
+	}{
+		{
+			name: "new tool without params includes empty properties and required",
+			tool: NewTool("hello_world", WithDescription("Say hello to someone")),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data, err := json.Marshal(tt.tool)
+			require.NoError(t, err)
+
+			var parsed map[string]any
+			require.NoError(t, json.Unmarshal(data, &parsed))
+
+			inputSchema, ok := parsed["inputSchema"].(map[string]any)
+			require.True(t, ok, "inputSchema should be an object")
+			assert.Equal(t, "object", inputSchema["type"])
+
+			props, ok := inputSchema["properties"].(map[string]any)
+			require.True(t, ok, "properties should be present as an object, not null or absent")
+			assert.Empty(t, props)
+
+			req, ok := inputSchema["required"].([]any)
+			require.True(t, ok, "required should be present as an array, not null or absent")
+			assert.Empty(t, req)
+		})
+	}
+}
+
+// TestToolExecutionMarshaling tests that the Execution field is properly marshaled in JSON output
+func TestToolExecutionMarshaling(t *testing.T) {
+	tests := []struct {
+		name            string
+		tool            Tool
+		expectExecution bool
+		expectedSupport TaskSupport
+	}{
+		{
+			name: "tool with task support forbidden",
+			tool: Tool{
+				Name:        "forbidden-tool",
+				Description: "A tool that forbids task augmentation",
+				InputSchema: ToolInputSchema{
+					Type:       "object",
+					Properties: map[string]any{},
+				},
+				Execution: &ToolExecution{
+					TaskSupport: TaskSupportForbidden,
+				},
+			},
+			expectExecution: true,
+			expectedSupport: TaskSupportForbidden,
+		},
+		{
+			name: "tool with task support optional",
+			tool: Tool{
+				Name:        "optional-tool",
+				Description: "A tool that optionally supports task augmentation",
+				InputSchema: ToolInputSchema{
+					Type:       "object",
+					Properties: map[string]any{},
+				},
+				Execution: &ToolExecution{
+					TaskSupport: TaskSupportOptional,
+				},
+			},
+			expectExecution: true,
+			expectedSupport: TaskSupportOptional,
+		},
+		{
+			name: "tool with task support required",
+			tool: Tool{
+				Name:        "required-tool",
+				Description: "A tool that requires task augmentation",
+				InputSchema: ToolInputSchema{
+					Type:       "object",
+					Properties: map[string]any{},
+				},
+				Execution: &ToolExecution{
+					TaskSupport: TaskSupportRequired,
+				},
+			},
+			expectExecution: true,
+			expectedSupport: TaskSupportRequired,
+		},
+		{
+			name: "tool without execution field",
+			tool: Tool{
+				Name:        "no-execution-tool",
+				Description: "A tool without execution configuration",
+				InputSchema: ToolInputSchema{
+					Type:       "object",
+					Properties: map[string]any{},
+				},
+				Execution: nil,
+			},
+			expectExecution: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Marshal the tool to JSON
+			data, err := json.Marshal(tt.tool)
+			assert.NoError(t, err)
+
+			// Unmarshal to map for comparison
+			var result map[string]any
+			err = json.Unmarshal(data, &result)
+			assert.NoError(t, err)
+
+			if tt.expectExecution {
+				// Check if execution field is present
+				assert.Contains(t, result, "execution", "Tool should include execution field")
+
+				execution, ok := result["execution"].(map[string]any)
+				assert.True(t, ok, "Execution field should be a map")
+
+				taskSupport, ok := execution["taskSupport"].(string)
+				assert.True(t, ok, "taskSupport should be a string")
+				assert.Equal(t, string(tt.expectedSupport), taskSupport, "taskSupport value should match")
+			} else {
+				// Check that execution field is not present
+				assert.NotContains(t, result, "execution", "Tool without Execution should not include execution field")
+			}
+		})
+	}
+}
+
+// TestTaskSupportConstants verifies the TaskSupport constants have the correct values
+func TestTaskSupportConstants(t *testing.T) {
+	assert.Equal(t, TaskSupport("forbidden"), TaskSupportForbidden)
+	assert.Equal(t, TaskSupport("optional"), TaskSupportOptional)
+	assert.Equal(t, TaskSupport("required"), TaskSupportRequired)
+}
+
+// TestWithTaskSupport tests the WithTaskSupport option for configuring tool task support
+func TestWithTaskSupport(t *testing.T) {
+	tests := []struct {
+		name            string
+		taskSupport     TaskSupport
+		expectedSupport TaskSupport
+	}{
+		{
+			name:            "task support forbidden",
+			taskSupport:     TaskSupportForbidden,
+			expectedSupport: TaskSupportForbidden,
+		},
+		{
+			name:            "task support optional",
+			taskSupport:     TaskSupportOptional,
+			expectedSupport: TaskSupportOptional,
+		},
+		{
+			name:            "task support required",
+			taskSupport:     TaskSupportRequired,
+			expectedSupport: TaskSupportRequired,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create a tool with task support
+			tool := NewTool("test-tool",
+				WithDescription("A test tool"),
+				WithTaskSupport(tt.taskSupport),
+			)
+
+			// Verify the Execution field is set
+			assert.NotNil(t, tool.Execution, "Execution should not be nil")
+			assert.Equal(t, tt.expectedSupport, tool.Execution.TaskSupport, "TaskSupport should match")
+
+			// Marshal to JSON and verify structure
+			data, err := json.Marshal(tool)
+			assert.NoError(t, err)
+
+			var result map[string]any
+			err = json.Unmarshal(data, &result)
+			assert.NoError(t, err)
+
+			// Verify execution field is present in JSON
+			assert.Contains(t, result, "execution", "Tool should include execution field in JSON")
+
+			execution, ok := result["execution"].(map[string]any)
+			assert.True(t, ok, "Execution field should be a map")
+
+			taskSupport, ok := execution["taskSupport"].(string)
+			assert.True(t, ok, "taskSupport should be a string")
+			assert.Equal(t, string(tt.expectedSupport), taskSupport, "taskSupport value should match in JSON")
+		})
+	}
+}
+
+// TestWithTaskSupport_InitializesExecution tests that WithTaskSupport creates Execution if nil
+func TestWithTaskSupport_InitializesExecution(t *testing.T) {
+	// Create a tool without any execution configuration
+	tool := Tool{
+		Name:        "test-tool",
+		Description: "A test tool",
+		InputSchema: ToolInputSchema{
+			Type:       "object",
+			Properties: map[string]any{},
+		},
+		Execution: nil,
+	}
+
+	// Verify Execution is nil
+	assert.Nil(t, tool.Execution)
+
+	// Apply WithTaskSupport option
+	option := WithTaskSupport(TaskSupportOptional)
+	option(&tool)
+
+	// Verify Execution is now initialized
+	assert.NotNil(t, tool.Execution, "WithTaskSupport should initialize Execution if nil")
+	assert.Equal(t, TaskSupportOptional, tool.Execution.TaskSupport)
+}
+
+// TestWithTaskSupport_PreservesExistingExecution tests that WithTaskSupport doesn't overwrite existing Execution
+func TestWithTaskSupport_PreservesExistingExecution(t *testing.T) {
+	// Create a tool with existing Execution
+	existingExecution := &ToolExecution{
+		TaskSupport: TaskSupportForbidden,
+	}
+
+	tool := Tool{
+		Name:        "test-tool",
+		Description: "A test tool",
+		InputSchema: ToolInputSchema{
+			Type:       "object",
+			Properties: map[string]any{},
+		},
+		Execution: existingExecution,
+	}
+
+	// Apply WithTaskSupport option
+	option := WithTaskSupport(TaskSupportRequired)
+	option(&tool)
+
+	// Verify Execution is the same instance (pointer equality)
+	assert.Same(t, existingExecution, tool.Execution, "WithTaskSupport should preserve existing Execution instance")
+	// Verify TaskSupport was updated
+	assert.Equal(t, TaskSupportRequired, tool.Execution.TaskSupport)
+}
+
+// TestCallToolRequest_WithTaskParams tests that CallToolRequest properly unmarshals task params
+func TestCallToolRequest_WithTaskParams(t *testing.T) {
+	tests := []struct {
+		name     string
+		jsonData string
+		expected CallToolRequest
+		wantErr  bool
+	}{
+		{
+			name: "request with task params",
+			jsonData: `{
+				"method": "tools/call",
+				"params": {
+					"name": "test-tool",
+					"arguments": {
+						"input": "test"
+					},
+					"task": {
+						"ttl": 300
+					}
+				}
+			}`,
+			expected: CallToolRequest{
+				Request: Request{
+					Method: "tools/call",
+				},
+				Params: CallToolParams{
+					Name: "test-tool",
+					Arguments: map[string]any{
+						"input": "test",
+					},
+					Task: &TaskParams{
+						TTL: ToInt64Ptr(300),
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "request without task params",
+			jsonData: `{
+				"method": "tools/call",
+				"params": {
+					"name": "test-tool",
+					"arguments": {
+						"input": "test"
+					}
+				}
+			}`,
+			expected: CallToolRequest{
+				Request: Request{
+					Method: "tools/call",
+				},
+				Params: CallToolParams{
+					Name: "test-tool",
+					Arguments: map[string]any{
+						"input": "test",
+					},
+					Task: nil,
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "request with null task params",
+			jsonData: `{
+				"method": "tools/call",
+				"params": {
+					"name": "test-tool",
+					"arguments": {
+						"input": "test"
+					},
+					"task": null
+				}
+			}`,
+			expected: CallToolRequest{
+				Request: Request{
+					Method: "tools/call",
+				},
+				Params: CallToolParams{
+					Name: "test-tool",
+					Arguments: map[string]any{
+						"input": "test",
+					},
+					Task: nil,
+				},
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var result CallToolRequest
+			err := json.Unmarshal([]byte(tt.jsonData), &result)
+
+			if tt.wantErr {
+				assert.Error(t, err)
+				return
+			}
+
+			assert.NoError(t, err)
+
+			// Compare method
+			assert.Equal(t, tt.expected.Method, result.Method)
+
+			// Compare tool name
+			assert.Equal(t, tt.expected.Params.Name, result.Params.Name)
+
+			// Compare arguments
+			expectedArgs, _ := tt.expected.Params.Arguments.(map[string]any)
+			resultArgs := result.GetArguments()
+			assert.Equal(t, expectedArgs, resultArgs)
+
+			// Compare task params
+			if tt.expected.Params.Task != nil {
+				assert.NotNil(t, result.Params.Task, "Task params should not be nil")
+				assert.Equal(t, tt.expected.Params.Task.TTL, result.Params.Task.TTL)
+			} else {
+				assert.Nil(t, result.Params.Task, "Task params should be nil")
+			}
+		})
+	}
+}
+
+// TestToolInputSchema_NoDoubleWrapping_Issue671 verifies that Tool schema
+// serialization does not wrap the inputSchema in an extra "properties" key.
+// See https://github.com/mark3labs/mcp-go/issues/671
+func TestToolInputSchema_NoDoubleWrapping_Issue671(t *testing.T) {
+	tests := []struct {
+		name string
+		tool Tool
+	}{
+		{
+			name: "tool created with WithString params",
+			tool: NewTool("test_tool",
+				WithDescription("Test tool"),
+				WithString("param1", Required(), Description("Parameter 1")),
+				WithString("param2", Required(), Description("Parameter 2")),
+			),
+		},
+		{
+			name: "tool created with mixed param types",
+			tool: NewTool("mixed_tool",
+				WithDescription("Mixed tool"),
+				WithString("name", Required(), Description("Name")),
+				WithNumber("count", Description("Count")),
+				WithBoolean("verbose", Description("Verbose")),
+			),
+		},
+		{
+			name: "tool created with no params",
+			tool: NewTool("no_params_tool",
+				WithDescription("No params tool"),
+			),
+		},
+		{
+			name: "tool with manually constructed schema",
+			tool: Tool{
+				Name:        "manual_tool",
+				Description: "Manual tool",
+				InputSchema: ToolInputSchema{
+					Type: "object",
+					Properties: map[string]any{
+						"param1": map[string]any{
+							"type":        "string",
+							"description": "Parameter 1",
+						},
+					},
+					Required: []string{"param1"},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data, err := json.Marshal(tt.tool)
+			require.NoError(t, err)
+
+			var parsed map[string]any
+			require.NoError(t, json.Unmarshal(data, &parsed))
+
+			inputSchema, ok := parsed["inputSchema"].(map[string]any)
+			require.True(t, ok, "inputSchema should be a JSON object")
+
+			// The inputSchema must have "type" at the top level.
+			// If it is missing, the schema is likely double-wrapped
+			// inside an extra "properties" key (the bug from #671).
+			assert.Equal(t, "object", inputSchema["type"],
+				"inputSchema must have 'type' at the top level, not nested inside 'properties'")
+
+			// Verify "properties" contains actual property definitions,
+			// not the entire schema object.
+			if props, hasProps := inputSchema["properties"].(map[string]any); hasProps {
+				_, propsHasType := props["type"]
+				_, propsHasProperties := props["properties"]
+				if propsHasType && propsHasProperties {
+					t.Error("inputSchema is double-wrapped: 'properties' contains 'type' and 'properties' keys, indicating the schema object was incorrectly nested")
+				}
+			}
+		})
+	}
+}
+
+// TestToolSchema_MarshalUnmarshal_RoundTrip_Issue671 verifies that
+// marshaling a Tool to JSON and unmarshaling it back produces the same
+// inputSchema structure without double-wrapping.
+// See https://github.com/mark3labs/mcp-go/issues/671
+func TestToolSchema_MarshalUnmarshal_RoundTrip_Issue671(t *testing.T) {
+	original := NewTool("test_tool",
+		WithDescription("Test tool"),
+		WithString("param1", Required(), Description("Parameter 1")),
+		WithString("param2", Required(), Description("Parameter 2")),
+	)
+
+	// Marshal
+	data, err := json.Marshal(original)
+	require.NoError(t, err)
+
+	// Unmarshal into a new Tool
+	var roundTripped Tool
+	require.NoError(t, json.Unmarshal(data, &roundTripped))
+
+	// Re-marshal
+	data2, err := json.Marshal(roundTripped)
+	require.NoError(t, err)
+
+	// Compare the two JSON outputs structurally
+	var parsed1, parsed2 map[string]any
+	require.NoError(t, json.Unmarshal(data, &parsed1))
+	require.NoError(t, json.Unmarshal(data2, &parsed2))
+
+	schema1 := parsed1["inputSchema"].(map[string]any)
+	schema2 := parsed2["inputSchema"].(map[string]any)
+
+	assert.Equal(t, schema1["type"], schema2["type"],
+		"type field should survive round-trip")
+	assert.Equal(t, fmt.Sprint(schema1["properties"]), fmt.Sprint(schema2["properties"]),
+		"properties field should survive round-trip")
+	assert.Equal(t, fmt.Sprint(schema1["required"]), fmt.Sprint(schema2["required"]),
+		"required field should survive round-trip")
+}
+
+// TestListToolsResult_Schema_Issue671 verifies that Tool schemas within a
+// ListToolsResult are serialized correctly without double-wrapping.
+// See https://github.com/mark3labs/mcp-go/issues/671
+func TestListToolsResult_Schema_Issue671(t *testing.T) {
+	tool := NewTool("test_tool",
+		WithDescription("Test tool"),
+		WithString("param1", Required(), Description("Parameter 1")),
+		WithString("param2", Required(), Description("Parameter 2")),
+	)
+
+	result := ListToolsResult{
+		Tools: []Tool{tool},
+	}
+
+	data, err := json.Marshal(result)
+	require.NoError(t, err)
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal(data, &parsed))
+
+	tools := parsed["tools"].([]any)
+	require.Len(t, tools, 1)
+
+	toolMap := tools[0].(map[string]any)
+	inputSchema := toolMap["inputSchema"].(map[string]any)
+
+	assert.Equal(t, "object", inputSchema["type"],
+		"inputSchema.type should be 'object'")
+
+	props := inputSchema["properties"].(map[string]any)
+	assert.Contains(t, props, "param1", "should contain param1")
+	assert.Contains(t, props, "param2", "should contain param2")
+
+	// Verify no double-wrapping
+	_, propsHasType := props["type"]
+	assert.False(t, propsHasType,
+		"properties should not contain a 'type' key (double-wrapping detected)")
+
+	required := inputSchema["required"].([]any)
+	assert.Len(t, required, 2)
+}
+
+// TestCallToolRequest_WithTaskParams_RoundTrip tests that marshaling and unmarshaling preserves task params
+func TestCallToolRequest_WithTaskParams_RoundTrip(t *testing.T) {
+	original := CallToolRequest{
+		Request: Request{
+			Method: "tools/call",
+		},
+		Params: CallToolParams{
+			Name: "async-tool",
+			Arguments: map[string]any{
+				"operation": "process",
+				"count":     42,
+			},
+			Task: &TaskParams{
+				TTL: ToInt64Ptr(600),
+			},
+		},
+	}
+
+	// Marshal to JSON
+	data, err := json.Marshal(original)
+	assert.NoError(t, err)
+
+	// Unmarshal back
+	var unmarshaled CallToolRequest
+	err = json.Unmarshal(data, &unmarshaled)
+	assert.NoError(t, err)
+
+	// Verify all fields are preserved
+	assert.Equal(t, original.Method, unmarshaled.Method)
+	assert.Equal(t, original.Params.Name, unmarshaled.Params.Name)
+
+	// Compare arguments
+	assert.Equal(t, "process", unmarshaled.GetString("operation", ""))
+	assert.Equal(t, 42, unmarshaled.GetInt("count", 0))
+
+	// Compare task params
+	assert.NotNil(t, unmarshaled.Params.Task)
+	assert.Equal(t, original.Params.Task.TTL, unmarshaled.Params.Task.TTL)
 }

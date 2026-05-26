@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -77,9 +78,7 @@ func (f *sessionTestClientWithTools) GetSessionTools() map[string]ServerTool {
 	}
 
 	toolsCopy := make(map[string]ServerTool, len(f.sessionTools))
-	for k, v := range f.sessionTools {
-		toolsCopy[k] = v
-	}
+	maps.Copy(toolsCopy, f.sessionTools)
 	return toolsCopy
 }
 
@@ -94,10 +93,62 @@ func (f *sessionTestClientWithTools) SetSessionTools(tools map[string]ServerTool
 	}
 
 	toolsCopy := make(map[string]ServerTool, len(tools))
-	for k, v := range tools {
-		toolsCopy[k] = v
-	}
+	maps.Copy(toolsCopy, tools)
 	f.sessionTools = toolsCopy
+}
+
+// sessionTestClientWithResources implements the SessionWithResources interface for testing
+type sessionTestClientWithResources struct {
+	sessionID           string
+	notificationChannel chan mcp.JSONRPCNotification
+	initialized         bool
+	sessionResources    map[string]ServerResource
+	mu                  sync.RWMutex // Mutex to protect concurrent access to sessionResources
+}
+
+func (f *sessionTestClientWithResources) SessionID() string {
+	return f.sessionID
+}
+
+func (f *sessionTestClientWithResources) NotificationChannel() chan<- mcp.JSONRPCNotification {
+	return f.notificationChannel
+}
+
+func (f *sessionTestClientWithResources) Initialize() {
+	f.initialized = true
+}
+
+func (f *sessionTestClientWithResources) Initialized() bool {
+	return f.initialized
+}
+
+func (f *sessionTestClientWithResources) GetSessionResources() map[string]ServerResource {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	if f.sessionResources == nil {
+		return nil
+	}
+
+	// Return a copy of the map to prevent concurrent modification
+	resourcesCopy := make(map[string]ServerResource, len(f.sessionResources))
+	maps.Copy(resourcesCopy, f.sessionResources)
+	return resourcesCopy
+}
+
+func (f *sessionTestClientWithResources) SetSessionResources(resources map[string]ServerResource) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if resources == nil {
+		f.sessionResources = nil
+		return
+	}
+
+	// Create a copy of the map to prevent concurrent modification
+	resourcesCopy := make(map[string]ServerResource, len(resources))
+	maps.Copy(resourcesCopy, resources)
+	f.sessionResources = resourcesCopy
 }
 
 // sessionTestClientWithClientInfo implements the SessionWithClientInfo interface for testing
@@ -151,7 +202,7 @@ func (f *sessionTestClientWithClientInfo) SetClientCapabilities(clientCapabiliti
 	f.clientCapabilities.Store(clientCapabilities)
 }
 
-// sessionTestClientWithTools implements the SessionWithLogging interface for testing
+// sessionTestClientWithLogging implements the SessionWithLogging interface for testing
 type sessionTestClientWithLogging struct {
 	sessionID           string
 	notificationChannel chan mcp.JSONRPCNotification
@@ -190,6 +241,7 @@ func (f *sessionTestClientWithLogging) GetLogLevel() mcp.LoggingLevel {
 var (
 	_ ClientSession         = (*sessionTestClient)(nil)
 	_ SessionWithTools      = (*sessionTestClientWithTools)(nil)
+	_ SessionWithResources  = (*sessionTestClientWithResources)(nil)
 	_ SessionWithLogging    = (*sessionTestClientWithLogging)(nil)
 	_ SessionWithClientInfo = (*sessionTestClientWithClientInfo)(nil)
 )
@@ -216,7 +268,7 @@ func TestSessionWithTools_Integration(t *testing.T) {
 	}
 
 	// Register the session
-	err := server.RegisterSession(context.Background(), session)
+	err := server.RegisterSession(t.Context(), session)
 	require.NoError(t, err)
 
 	// Test that we can access the session-specific tool
@@ -225,7 +277,7 @@ func TestSessionWithTools_Integration(t *testing.T) {
 	testReq.Params.Arguments = map[string]any{}
 
 	// Call using session context
-	sessionCtx := server.WithContext(context.Background(), session)
+	sessionCtx := server.WithContext(t.Context(), session)
 
 	// Check if the session was stored in the context correctly
 	s := ClientSessionFromContext(sessionCtx)
@@ -260,6 +312,75 @@ func TestSessionWithTools_Integration(t *testing.T) {
 	})
 }
 
+func TestSessionWithResources_Integration(t *testing.T) {
+	server := NewMCPServer("test-server", "1.0.0")
+
+	// Create session-specific resources
+	sessionResource := ServerResource{
+		Resource: mcp.NewResource("ui://resource", "session-resource"),
+		Handler: func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+			return []mcp.ResourceContents{mcp.TextResourceContents{
+				URI:  "ui://resource",
+				Text: "session-resource result",
+			}}, nil
+		},
+	}
+
+	// Create a session with resources
+	session := &sessionTestClientWithResources{
+		sessionID:           "session-1",
+		notificationChannel: make(chan mcp.JSONRPCNotification, 10),
+		initialized:         true,
+		sessionResources: map[string]ServerResource{
+			"ui://resource": sessionResource,
+		},
+	}
+
+	// Register the session
+	err := server.RegisterSession(t.Context(), session)
+	require.NoError(t, err)
+
+	// Test that we can access the session-specific resource
+	testReq := mcp.ReadResourceRequest{}
+	testReq.Params.URI = "ui://resource"
+	testReq.Params.Arguments = map[string]any{}
+
+	// Call using session context
+	sessionCtx := server.WithContext(t.Context(), session)
+
+	// Check if the session was stored in the context correctly
+	s := ClientSessionFromContext(sessionCtx)
+	require.NotNil(t, s, "Session should be available from context")
+	assert.Equal(t, session.SessionID(), s.SessionID(), "Session ID should match")
+
+	// Check if the session can be cast to SessionWithResources
+	swr, ok := s.(SessionWithResources)
+	require.True(t, ok, "Session should implement SessionWithResources")
+
+	// Check if the resources are accessible
+	resources := swr.GetSessionResources()
+	require.NotNil(t, resources, "Session resources should be available")
+	require.Contains(t, resources, "ui://resource", "Session should have ui://resource")
+
+	// Test session resource access with session context
+	t.Run("test session resource access", func(t *testing.T) {
+		// First test directly getting the resource from session resources
+		resource, exists := resources["ui://resource"]
+		require.True(t, exists, "Session resource should exist in the map")
+		require.NotNil(t, resource, "Session resource should not be nil")
+
+		// Now test calling directly with the handler
+		result, err := resource.Handler(sessionCtx, testReq)
+		require.NoError(t, err, "No error calling session resource handler directly")
+		require.NotNil(t, result, "Result should not be nil")
+		require.Len(t, result, 1, "Result should have one content item")
+
+		textContent, ok := result[0].(mcp.TextResourceContents)
+		require.True(t, ok, "Content should be TextResourceContents")
+		assert.Equal(t, "session-resource result", textContent.Text, "Result text should match")
+	})
+}
+
 func TestMCPServer_ToolsWithSessionTools(t *testing.T) {
 	// Basic test to verify that session-specific tools are returned correctly in a tools list
 	server := NewMCPServer("test-server", "1.0.0", WithToolCapabilities(true))
@@ -282,11 +403,11 @@ func TestMCPServer_ToolsWithSessionTools(t *testing.T) {
 	}
 
 	// Register the session
-	err := server.RegisterSession(context.Background(), session)
+	err := server.RegisterSession(t.Context(), session)
 	require.NoError(t, err)
 
 	// List tools with session context
-	sessionCtx := server.WithContext(context.Background(), session)
+	sessionCtx := server.WithContext(t.Context(), session)
 	resp := server.HandleMessage(sessionCtx, []byte(`{
 		"jsonrpc": "2.0",
 		"id": 1,
@@ -314,9 +435,111 @@ func TestMCPServer_ToolsWithSessionTools(t *testing.T) {
 	assert.True(t, found, "Should find the overridden global tool")
 }
 
+func TestMCPServer_ResourcesWithSessionResources(t *testing.T) {
+	server := NewMCPServer("test-server", "1.0.0", WithResourceCapabilities(false, false))
+
+	// Add global resources
+	server.AddResources(
+		ServerResource{
+			Resource: mcp.NewResource("test://global1", "global-resource-1"),
+			Handler: func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+				return []mcp.ResourceContents{mcp.TextResourceContents{
+					URI:  "test://global1",
+					Text: "global-resource-1 result",
+				}}, nil
+			},
+		},
+		ServerResource{
+			Resource: mcp.NewResource("test://global2", "global-resource-2"),
+			Handler: func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+				return []mcp.ResourceContents{mcp.TextResourceContents{
+					URI:  "test://global2",
+					Text: "global-resource-2 result",
+				}}, nil
+			},
+		},
+	)
+
+	// Create a session with resources that override global-resource-1
+	session := &sessionTestClientWithResources{
+		sessionID:           "session-1",
+		notificationChannel: make(chan mcp.JSONRPCNotification, 10),
+		initialized:         true,
+		sessionResources: map[string]ServerResource{
+			"test://global1": {
+				Resource: mcp.NewResource("test://global1", "global-resource-1-overridden"),
+				Handler: func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+					return []mcp.ResourceContents{mcp.TextResourceContents{
+						URI:  "test://global1",
+						Text: "session-overridden result",
+					}}, nil
+				},
+			},
+		},
+	}
+
+	// Register the session
+	err := server.RegisterSession(t.Context(), session)
+	require.NoError(t, err)
+
+	// List resources with session context via HandleMessage
+	sessionCtx := server.WithContext(t.Context(), session)
+	resp := server.HandleMessage(sessionCtx, []byte(`{
+		"jsonrpc": "2.0",
+		"id": 1,
+		"method": "resources/list"
+	}`))
+
+	jsonResp, ok := resp.(mcp.JSONRPCResponse)
+	require.True(t, ok, "Response should be a JSONRPCResponse")
+
+	result, ok := jsonResp.Result.(mcp.ListResourcesResult)
+	require.True(t, ok, "Result should be a ListResourcesResult")
+
+	// Should have 2 resources - global-resource-2 not overridden and global-resource-1 overridden
+	assert.Len(t, result.Resources, 2, "Should have 2 resources")
+
+	// Find the resources and verify
+	resourceMap := make(map[string]mcp.Resource)
+	for _, resource := range result.Resources {
+		resourceMap[resource.URI] = resource
+	}
+
+	// Verify global resource not overridden appears
+	require.Contains(t, resourceMap, "test://global2", "Should have non-overridden global resource")
+	assert.Equal(t, "global-resource-2", resourceMap["test://global2"].Name, "Global resource name should match")
+
+	// Verify overridden global resource appears with session override
+	require.Contains(t, resourceMap, "test://global1", "Should have overridden global resource")
+	assert.Equal(t, "global-resource-1-overridden", resourceMap["test://global1"].Name, "Overridden resource name should match session version")
+
+	// Read the overridden resource and confirm it returns the session handler's content
+	t.Run("read overridden resource via HandleMessage", func(t *testing.T) {
+		readResp := server.HandleMessage(sessionCtx, []byte(`{
+			"jsonrpc": "2.0",
+			"id": 2,
+			"method": "resources/read",
+			"params": {
+				"uri": "test://global1"
+			}
+		}`))
+
+		readJSONResp, ok := readResp.(mcp.JSONRPCResponse)
+		require.True(t, ok, "Read response should be a JSONRPCResponse")
+
+		readResult, ok := readJSONResp.Result.(mcp.ReadResourceResult)
+		require.True(t, ok, "Result should be a ReadResourceResult")
+
+		require.Len(t, readResult.Contents, 1, "Should have one content item")
+		textContent, ok := readResult.Contents[0].(mcp.TextResourceContents)
+		require.True(t, ok, "Content should be TextResourceContents")
+		assert.Equal(t, "session-overridden result", textContent.Text, "Should return session handler's content")
+	})
+}
+
 func TestMCPServer_AddSessionTools(t *testing.T) {
 	server := NewMCPServer("test-server", "1.0.0", WithToolCapabilities(true))
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Create a session
 	sessionChan := make(chan mcp.JSONRPCNotification, 10)
@@ -351,7 +574,7 @@ func TestMCPServer_AddSessionTools(t *testing.T) {
 
 func TestMCPServer_AddSessionTool(t *testing.T) {
 	server := NewMCPServer("test-server", "1.0.0", WithToolCapabilities(true))
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Create a session
 	sessionChan := make(chan mcp.JSONRPCNotification, 10)
@@ -411,7 +634,7 @@ func TestMCPServer_AddSessionToolsUninitialized(t *testing.T) {
 		WithToolCapabilities(true),
 		WithHooks(hooks),
 	)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Create an uninitialized session
 	sessionChan := make(chan mcp.JSONRPCNotification, 1)
@@ -504,7 +727,7 @@ func TestMCPServer_DeleteSessionToolsUninitialized(t *testing.T) {
 		WithToolCapabilities(true),
 		WithHooks(hooks),
 	)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Create an uninitialized session with some tools
 	sessionChan := make(chan mcp.JSONRPCNotification, 1)
@@ -587,7 +810,7 @@ func TestMCPServer_CallSessionTool(t *testing.T) {
 	}
 
 	// Register the session
-	err := server.RegisterSession(context.Background(), session)
+	err := server.RegisterSession(t.Context(), session)
 	require.NoError(t, err)
 
 	// Add session-specific tool with the same name to override the global tool
@@ -601,7 +824,7 @@ func TestMCPServer_CallSessionTool(t *testing.T) {
 	require.NoError(t, err)
 
 	// Call the tool using session context
-	sessionCtx := server.WithContext(context.Background(), session)
+	sessionCtx := server.WithContext(t.Context(), session)
 	toolRequest := map[string]any{
 		"jsonrpc": "2.0",
 		"id":      1,
@@ -619,10 +842,13 @@ func TestMCPServer_CallSessionTool(t *testing.T) {
 	resp, ok := response.(mcp.JSONRPCResponse)
 	assert.True(t, ok)
 
-	callToolResult, ok := resp.Result.(mcp.CallToolResult)
-	assert.True(t, ok)
+	// Result is a *CallToolResult, need to type-assert
+	callToolResult, ok := resp.Result.(*mcp.CallToolResult)
+	assert.True(t, ok, "Result should be *CallToolResult for sync tool call")
+	require.NotNil(t, callToolResult)
 
 	// Since we specify a tool with the same name for current session, the expected text should be "session result"
+	require.NotEmpty(t, callToolResult.Content, "Content should not be empty")
 	if text := callToolResult.Content[0].(mcp.TextContent).Text; text != "session result" {
 		t.Errorf("Expected result 'session result', got %q", text)
 	}
@@ -630,7 +856,7 @@ func TestMCPServer_CallSessionTool(t *testing.T) {
 
 func TestMCPServer_DeleteSessionTools(t *testing.T) {
 	server := NewMCPServer("test-server", "1.0.0", WithToolCapabilities(true))
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Create a session with tools
 	sessionChan := make(chan mcp.JSONRPCNotification, 10)
@@ -714,11 +940,11 @@ func TestMCPServer_ToolFiltering(t *testing.T) {
 	}
 
 	// Register the session
-	err := server.RegisterSession(context.Background(), session)
+	err := server.RegisterSession(t.Context(), session)
 	require.NoError(t, err)
 
 	// List tools with session context
-	sessionCtx := server.WithContext(context.Background(), session)
+	sessionCtx := server.WithContext(t.Context(), session)
 	response := server.HandleMessage(sessionCtx, []byte(`{
 		"jsonrpc": "2.0",
 		"id": 1,
@@ -738,6 +964,207 @@ func TestMCPServer_ToolFiltering(t *testing.T) {
 		assert.True(t, len(tool.Name) >= 6 && tool.Name[:6] == "allow-",
 			"Tool should start with 'allow-', got: %s", tool.Name)
 	}
+}
+
+func TestMCPServer_PromptFiltering(t *testing.T) {
+	// Create a filter that filters prompts by prefix
+	filterByPrefix := func(prefix string) PromptFilterFunc {
+		return func(ctx context.Context, prompts []mcp.Prompt) []mcp.Prompt {
+			var filtered []mcp.Prompt
+			for _, prompt := range prompts {
+				if len(prompt.Name) >= len(prefix) && prompt.Name[:len(prefix)] == prefix {
+					filtered = append(filtered, prompt)
+				}
+			}
+			return filtered
+		}
+	}
+
+	// Create a server with a prompt filter
+	server := NewMCPServer("test-server", "1.0.0",
+		WithPromptCapabilities(true),
+		WithPromptFilter(filterByPrefix("allow-")),
+	)
+
+	// Add prompts with different prefixes
+	noopHandler := func(ctx context.Context, req mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+		return &mcp.GetPromptResult{}, nil
+	}
+	server.AddPrompt(mcp.Prompt{Name: "allow-prompt-1"}, noopHandler)
+	server.AddPrompt(mcp.Prompt{Name: "allow-prompt-2"}, noopHandler)
+	server.AddPrompt(mcp.Prompt{Name: "deny-prompt-1"}, noopHandler)
+	server.AddPrompt(mcp.Prompt{Name: "deny-prompt-2"}, noopHandler)
+
+	// List prompts
+	ctx := t.Context()
+	response := server.HandleMessage(ctx, []byte(`{
+		"jsonrpc": "2.0",
+		"id": 1,
+		"method": "prompts/list"
+	}`))
+	resp, ok := response.(mcp.JSONRPCResponse)
+	require.True(t, ok)
+
+	result, ok := resp.Result.(mcp.ListPromptsResult)
+	require.True(t, ok)
+
+	// Should only include prompts with the "allow-" prefix
+	assert.Len(t, result.Prompts, 2)
+	for _, prompt := range result.Prompts {
+		assert.True(t, len(prompt.Name) >= 6 && prompt.Name[:6] == "allow-",
+			"Prompt should start with 'allow-', got: %s", prompt.Name)
+	}
+}
+
+func TestMCPServer_MultiplePromptFilters(t *testing.T) {
+	// First filter: keep only prompts starting with "a"
+	filterA := func(ctx context.Context, prompts []mcp.Prompt) []mcp.Prompt {
+		var filtered []mcp.Prompt
+		for _, p := range prompts {
+			if len(p.Name) > 0 && p.Name[0] == 'a' {
+				filtered = append(filtered, p)
+			}
+		}
+		return filtered
+	}
+	// Second filter: keep only prompts containing "keep"
+	filterKeep := func(ctx context.Context, prompts []mcp.Prompt) []mcp.Prompt {
+		var filtered []mcp.Prompt
+		for _, p := range prompts {
+			for i := 0; i+4 <= len(p.Name); i++ {
+				if p.Name[i:i+4] == "keep" {
+					filtered = append(filtered, p)
+					break
+				}
+			}
+		}
+		return filtered
+	}
+
+	server := NewMCPServer("test-server", "1.0.0",
+		WithPromptCapabilities(true),
+		WithPromptFilter(PromptFilterFunc(filterA)),
+		WithPromptFilter(PromptFilterFunc(filterKeep)),
+	)
+
+	noopHandler := func(ctx context.Context, req mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+		return &mcp.GetPromptResult{}, nil
+	}
+	server.AddPrompt(mcp.Prompt{Name: "a-keep-this"}, noopHandler)
+	server.AddPrompt(mcp.Prompt{Name: "a-remove-this"}, noopHandler)
+	server.AddPrompt(mcp.Prompt{Name: "b-keep-this"}, noopHandler)
+
+	ctx := t.Context()
+	response := server.HandleMessage(ctx, []byte(`{
+		"jsonrpc": "2.0",
+		"id": 1,
+		"method": "prompts/list"
+	}`))
+	resp, ok := response.(mcp.JSONRPCResponse)
+	require.True(t, ok)
+
+	result, ok := resp.Result.(mcp.ListPromptsResult)
+	require.True(t, ok)
+
+	// Only "a-keep-this" should survive both filters
+	assert.Len(t, result.Prompts, 1)
+	assert.Equal(t, "a-keep-this", result.Prompts[0].Name)
+}
+
+func TestMCPServer_PromptHandlerMiddleware(t *testing.T) {
+	server := NewMCPServer("test-server", "1.0.0",
+		WithPromptCapabilities(true),
+		WithPromptHandlerMiddleware(func(next PromptHandlerFunc) PromptHandlerFunc {
+			return func(ctx context.Context, req mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+				result, err := next(ctx, req)
+				if err != nil {
+					return nil, err
+				}
+				// Middleware appends a message
+				result.Messages = append(result.Messages, mcp.PromptMessage{
+					Role: mcp.RoleAssistant,
+					Content: mcp.TextContent{
+						Type: "text",
+						Text: "added-by-middleware",
+					},
+				})
+				return result, nil
+			}
+		}),
+	)
+
+	server.AddPrompt(mcp.Prompt{Name: "test-prompt"}, func(ctx context.Context, req mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+		return &mcp.GetPromptResult{
+			Messages: []mcp.PromptMessage{
+				{
+					Role:    mcp.RoleUser,
+					Content: mcp.TextContent{Type: "text", Text: "original"},
+				},
+			},
+		}, nil
+	})
+
+	ctx := t.Context()
+	response := server.HandleMessage(ctx, []byte(`{
+		"jsonrpc": "2.0",
+		"id": 1,
+		"method": "prompts/get",
+		"params": {"name": "test-prompt"}
+	}`))
+	resp, ok := response.(mcp.JSONRPCResponse)
+	require.True(t, ok)
+
+	result, ok := resp.Result.(mcp.GetPromptResult)
+	require.True(t, ok)
+
+	assert.Len(t, result.Messages, 2)
+	// Verify original message is first
+	tc, ok := result.Messages[0].Content.(mcp.TextContent)
+	require.True(t, ok)
+	assert.Equal(t, "original", tc.Text)
+	// Verify middleware-added message is second
+	tc, ok = result.Messages[1].Content.(mcp.TextContent)
+	require.True(t, ok)
+	assert.Equal(t, "added-by-middleware", tc.Text)
+}
+
+func TestMCPServer_MultiplePromptHandlerMiddlewares(t *testing.T) {
+	var order []string
+
+	makeMiddleware := func(name string) PromptHandlerMiddleware {
+		return func(next PromptHandlerFunc) PromptHandlerFunc {
+			return func(ctx context.Context, req mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+				order = append(order, name+"-before")
+				result, err := next(ctx, req)
+				order = append(order, name+"-after")
+				return result, err
+			}
+		}
+	}
+
+	server := NewMCPServer("test-server", "1.0.0",
+		WithPromptCapabilities(true),
+		WithPromptHandlerMiddleware(makeMiddleware("first")),
+		WithPromptHandlerMiddleware(makeMiddleware("second")),
+	)
+
+	server.AddPrompt(mcp.Prompt{Name: "test-prompt"}, func(ctx context.Context, req mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+		order = append(order, "handler")
+		return &mcp.GetPromptResult{}, nil
+	})
+
+	ctx := t.Context()
+	response := server.HandleMessage(ctx, []byte(`{
+		"jsonrpc": "2.0",
+		"id": 1,
+		"method": "prompts/get",
+		"params": {"name": "test-prompt"}
+	}`))
+	_, ok := response.(mcp.JSONRPCResponse)
+	require.True(t, ok)
+
+	// Middlewares applied in reverse order means first-registered wraps outermost
+	assert.Equal(t, []string{"first-before", "second-before", "handler", "second-after", "first-after"}, order)
 }
 
 func TestMCPServer_SendNotificationToSpecificClient(t *testing.T) {
@@ -764,11 +1191,11 @@ func TestMCPServer_SendNotificationToSpecificClient(t *testing.T) {
 	}
 
 	// Register sessions
-	err := server.RegisterSession(context.Background(), session1)
+	err := server.RegisterSession(t.Context(), session1)
 	require.NoError(t, err)
-	err = server.RegisterSession(context.Background(), session2)
+	err = server.RegisterSession(t.Context(), session2)
 	require.NoError(t, err)
-	err = server.RegisterSession(context.Background(), session3)
+	err = server.RegisterSession(t.Context(), session3)
 	require.NoError(t, err)
 
 	// Send notification to session 1
@@ -843,7 +1270,7 @@ func TestMCPServer_NotificationChannelBlocked(t *testing.T) {
 	session.Initialize()
 
 	// Register the session
-	err := server.RegisterSession(context.Background(), session)
+	err := server.RegisterSession(t.Context(), session)
 	require.NoError(t, err)
 
 	// Fill the buffer first to ensure it gets blocked
@@ -939,7 +1366,7 @@ func TestMCPServer_SessionToolCapabilitiesBehavior(t *testing.T) {
 				notificationChannel: make(chan mcp.JSONRPCNotification, 10),
 				initialized:         true,
 			}
-			err := server.RegisterSession(context.Background(), session)
+			err := server.RegisterSession(t.Context(), session)
 			require.NoError(t, err)
 
 			// Add a session tool and verify listChanged remains false
@@ -962,7 +1389,7 @@ func TestMCPServer_ToolNotificationsDisabled(t *testing.T) {
 
 	// Create a server WITHOUT tool capabilities
 	server := NewMCPServer("test-server", "1.0.0", WithToolCapabilities(false))
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Create an initialized session
 	sessionChan := make(chan mcp.JSONRPCNotification, 1)
@@ -1023,11 +1450,11 @@ func TestMCPServer_SetLevelNotEnabled(t *testing.T) {
 	session.Initialize()
 
 	// Register the session
-	err := server.RegisterSession(context.Background(), session)
+	err := server.RegisterSession(t.Context(), session)
 	require.NoError(t, err)
 
 	// Try to set logging level when capability is disabled
-	sessionCtx := server.WithContext(context.Background(), session)
+	sessionCtx := server.WithContext(t.Context(), session)
 	setRequest := map[string]any{
 		"jsonrpc": "2.0",
 		"id":      1,
@@ -1065,11 +1492,11 @@ func TestMCPServer_SetLevel(t *testing.T) {
 	}
 
 	// Register the session
-	err := server.RegisterSession(context.Background(), session)
+	err := server.RegisterSession(t.Context(), session)
 	require.NoError(t, err)
 
 	// Set Logging level to critical
-	sessionCtx := server.WithContext(context.Background(), session)
+	sessionCtx := server.WithContext(t.Context(), session)
 	setRequest := map[string]any{
 		"jsonrpc": "2.0",
 		"id":      1,
@@ -1105,7 +1532,7 @@ func TestSessionWithClientInfo_Integration(t *testing.T) {
 		initialized:         false,
 	}
 
-	err := server.RegisterSession(context.Background(), session)
+	err := server.RegisterSession(t.Context(), session)
 	require.NoError(t, err)
 
 	clientInfo := mcp.Implementation{
@@ -1114,7 +1541,7 @@ func TestSessionWithClientInfo_Integration(t *testing.T) {
 	}
 
 	clientCapability := mcp.ClientCapabilities{
-		Sampling: &struct{}{},
+		Sampling: &mcp.SamplingCapability{},
 	}
 
 	initRequest := mcp.InitializeRequest{}
@@ -1122,7 +1549,7 @@ func TestSessionWithClientInfo_Integration(t *testing.T) {
 	initRequest.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
 	initRequest.Params.Capabilities = clientCapability
 
-	sessionCtx := server.WithContext(context.Background(), session)
+	sessionCtx := server.WithContext(t.Context(), session)
 
 	// Retrieve the session from context
 	retrievedSession := ClientSessionFromContext(sessionCtx)
@@ -1152,7 +1579,7 @@ func TestSessionWithClientInfo_Integration(t *testing.T) {
 // New test function to cover log notification functionality
 func TestMCPServer_SendLogMessageToClient(t *testing.T) {
 	server := NewMCPServer("test-server", "1.0.0", WithLogging())
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Create a session that supports logging
 	sessionChan := make(chan mcp.JSONRPCNotification, 10)
@@ -1245,7 +1672,7 @@ func TestMCPServer_SendLogMessageToClient(t *testing.T) {
 
 func TestMCPServer_SendLogMessageToSpecificClient(t *testing.T) {
 	server := NewMCPServer("test-server", "1.0.0", WithLogging())
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Create two sessions
 	session1Chan := make(chan mcp.JSONRPCNotification, 10)
@@ -1367,7 +1794,7 @@ func TestMCPServer_SendLogMessageToSpecificClient(t *testing.T) {
 
 func TestMCPServer_LoggingWithUnsupportedSessions(t *testing.T) {
 	server := NewMCPServer("test-server", "1.0.0", WithLogging())
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Create three types of sessions:
 	// 1. Logging-supported session
@@ -1454,7 +1881,7 @@ func TestMCPServer_LoggingWithUnsupportedSessions(t *testing.T) {
 
 func TestMCPServer_LoggingNotificationFormat(t *testing.T) {
 	server := NewMCPServer("test-server", "1.0.0", WithLogging())
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Create a session
 	sessionChan := make(chan mcp.JSONRPCNotification, 10)

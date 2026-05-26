@@ -10,6 +10,7 @@ type MCPRequestType struct {
 	GroupHookName  string
 	UnmarshalError string
 	HandlerFunc    string
+	ResultIsAny    bool // If true, result type is 'any' instead of '*mcp.ResultType'
 }
 
 var MCPRequestTypes = []MCPRequestType{
@@ -68,6 +69,26 @@ var MCPRequestTypes = []MCPRequestType{
 		UnmarshalError: "invalid read resource request",
 		HandlerFunc:    "handleReadResource",
 	}, {
+		MethodName:     "MethodResourcesSubscribe",
+		ParamType:      "SubscribeRequest",
+		ResultType:     "EmptyResult",
+		Group:          "resources",
+		GroupName:      "Resources",
+		GroupHookName:  "Resource",
+		HookName:       "Subscribe",
+		UnmarshalError: "invalid subscribe request",
+		HandlerFunc:    "handleSubscribe",
+	}, {
+		MethodName:     "MethodResourcesUnsubscribe",
+		ParamType:      "UnsubscribeRequest",
+		ResultType:     "EmptyResult",
+		Group:          "resources",
+		GroupName:      "Resources",
+		GroupHookName:  "Resource",
+		HookName:       "Unsubscribe",
+		UnmarshalError: "invalid unsubscribe request",
+		HandlerFunc:    "handleUnsubscribe",
+	}, {
 		MethodName:     "MethodPromptsList",
 		ParamType:      "ListPromptsRequest",
 		ResultType:     "ListPromptsResult",
@@ -107,5 +128,56 @@ var MCPRequestTypes = []MCPRequestType{
 		HookName:       "CallTool",
 		UnmarshalError: "invalid call tool request",
 		HandlerFunc:    "handleToolCall",
+		ResultIsAny:    true, // Returns 'any' to support both CallToolResult and CreateTaskResult
+	}, {
+		MethodName:     "MethodTasksGet",
+		ParamType:      "GetTaskRequest",
+		ResultType:     "GetTaskResult",
+		Group:          "tasks",
+		GroupName:      "Tasks",
+		GroupHookName:  "Task",
+		HookName:       "GetTask",
+		UnmarshalError: "invalid get task request",
+		HandlerFunc:    "handleGetTask",
+	}, {
+		MethodName:     "MethodTasksList",
+		ParamType:      "ListTasksRequest",
+		ResultType:     "ListTasksResult",
+		Group:          "tasks",
+		GroupName:      "Tasks",
+		GroupHookName:  "Task",
+		HookName:       "ListTasks",
+		UnmarshalError: "invalid list tasks request",
+		HandlerFunc:    "handleListTasks",
+	}, {
+		MethodName:     "MethodTasksResult",
+		ParamType:      "TaskResultRequest",
+		ResultType:     "TaskResultResult",
+		Group:          "tasks",
+		GroupName:      "Tasks",
+		GroupHookName:  "Task",
+		HookName:       "TaskResult",
+		UnmarshalError: "invalid task result request",
+		HandlerFunc:    "handleTaskResult",
+	}, {
+		MethodName:     "MethodTasksCancel",
+		ParamType:      "CancelTaskRequest",
+		ResultType:     "CancelTaskResult",
+		Group:          "tasks",
+		GroupName:      "Tasks",
+		GroupHookName:  "Task",
+		HookName:       "CancelTask",
+		UnmarshalError: "invalid cancel task request",
+		HandlerFunc:    "handleCancelTask",
+	}, {
+		MethodName:     "MethodCompletionComplete",
+		ParamType:      "CompleteRequest",
+		ResultType:     "CompleteResult",
+		Group:          "completions",
+		GroupName:      "Completions",
+		GroupHookName:  "Completion",
+		HookName:       "Complete",
+		UnmarshalError: "invalid completion request",
+		HandlerFunc:    "handleComplete",
 	},
 }
