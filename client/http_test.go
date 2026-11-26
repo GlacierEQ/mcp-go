@@ -3,6 +3,10 @@ package client
 import (
 	"context"
 	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
@@ -11,6 +15,8 @@ import (
 	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	servertest "github.com/mark3labs/mcp-go/server/servertest"
+	"github.com/stretchr/testify/require"
 )
 
 func TestHTTPClient(t *testing.T) {
@@ -68,7 +74,7 @@ func TestHTTPClient(t *testing.T) {
 		)
 	}
 
-	testServer := server.NewTestStreamableHTTPServer(mcpServer)
+	testServer := servertest.NewTestStreamableHTTPServer(mcpServer)
 	defer testServer.Close()
 
 	initRequest := mcp.InitializeRequest{
@@ -203,6 +209,102 @@ func TestHTTPClient(t *testing.T) {
 	})
 }
 
+func TestHTTPClientDoesNotForwardServerReceivedHeaders(t *testing.T) {
+	backendServer := server.NewMCPServer(
+		"backend",
+		"1.0.0",
+		server.WithToolCapabilities(true),
+	)
+
+	var received http.Header
+	backendServer.AddTool(
+		mcp.NewTool("echo"),
+		func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			received = request.Header.Clone()
+			return mcp.NewToolResultText("ok"), nil
+		},
+	)
+
+	backendHTTP := servertest.NewTestStreamableHTTPServer(backendServer)
+	defer backendHTTP.Close()
+
+	backendClient, err := NewStreamableHttpClient(backendHTTP.URL)
+	require.NoError(t, err)
+	defer backendClient.Close()
+	require.NoError(t, backendClient.Start(t.Context()))
+	_, err = backendClient.Initialize(t.Context(), mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+			ClientInfo: mcp.Implementation{
+				Name:    "proxy-client",
+				Version: "1.0.0",
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	proxyServer := server.NewMCPServer(
+		"proxy",
+		"1.0.0",
+		server.WithToolCapabilities(true),
+	)
+	proxyServer.AddTool(
+		mcp.NewTool("echo"),
+		func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return backendClient.CallTool(ctx, request)
+		},
+	)
+	proxyHTTP := servertest.NewTestStreamableHTTPServer(proxyServer)
+	defer proxyHTTP.Close()
+
+	endClient, err := NewStreamableHttpClient(proxyHTTP.URL)
+	require.NoError(t, err)
+	defer endClient.Close()
+	require.NoError(t, endClient.Start(t.Context()))
+	_, err = endClient.Initialize(t.Context(), mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+			ClientInfo: mcp.Implementation{
+				Name:    "end-client",
+				Version: "1.0.0",
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = endClient.CallTool(t.Context(), mcp.CallToolRequest{
+		Header: http.Header{
+			"Accept-Encoding": {"gzip, deflate"},
+			"Authorization":   {"Bearer inbound-token"},
+			"Cookie":          {"session=inbound"},
+			"X-Proxy-Auth":    {"proxy-secret"},
+		},
+		Params: mcp.CallToolParams{
+			Name: "echo",
+		},
+	})
+	require.NoError(t, err)
+
+	require.NotContains(t, received.Values("Accept-Encoding"), "gzip, deflate")
+	require.Empty(t, received.Values("Authorization"))
+	require.Empty(t, received.Values("Cookie"))
+	require.Empty(t, received.Values("X-Proxy-Auth"))
+	require.Equal(t, "application/json", received.Get("Content-Type"))
+
+	explicitRequest := mcp.CallToolRequest{
+		Header: http.Header{
+			"X-Backend-Auth": {"allowed"},
+		},
+		Params: mcp.CallToolParams{
+			Name: "echo",
+		},
+	}
+
+	_, err = backendClient.CallTool(t.Context(), explicitRequest)
+	require.NoError(t, err)
+	require.Equal(t, "allowed", received.Get("X-Backend-Auth"))
+}
+
 type SafeMap struct {
 	mu   sync.RWMutex
 	data map[string]int
@@ -230,4 +332,99 @@ func (sm *SafeMap) Len() int {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	return len(sm.data)
+}
+
+// After the server ends a session, the caller re-initializes, and the
+// server/discover probe finds a server on protocol version 2026-07-28, which
+// has no sessions. Requests go out again.
+func TestStreamableHTTP_ReinitializeOnTheModernProtocol(t *testing.T) {
+	mcpServer := server.NewMCPServer("test-server", "1.0.0", server.WithToolCapabilities(true))
+	httpServer := servertest.NewTestStreamableHTTPServer(mcpServer, server.WithStateful(true))
+	defer httpServer.Close()
+	c, err := NewStreamableHttpClient(httpServer.URL)
+	require.NoError(t, err)
+	defer c.Close()
+	ctx := t.Context()
+	require.NoError(t, c.Start(ctx))
+
+	legacy := mcp.InitializeRequest{}
+	legacy.Params.ProtocolVersion = mcp.LATEST_LEGACY_PROTOCOL_VERSION
+	legacy.Params.ClientInfo = mcp.Implementation{Name: "test-client", Version: "1.0.0"}
+	_, err = c.Initialize(ctx, legacy)
+	require.NoError(t, err)
+	sessionID := c.GetSessionId()
+	require.NotEmpty(t, sessionID)
+
+	// End the session, as the server does when it expires one.
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, httpServer.URL, nil)
+	require.NoError(t, err)
+	req.Header.Set(transport.HeaderKeySessionID, sessionID)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	_, err = c.ListTools(ctx, mcp.ListToolsRequest{})
+	require.ErrorIs(t, err, transport.ErrSessionTerminated)
+
+	modern := mcp.InitializeRequest{}
+	modern.Params.ClientInfo = mcp.Implementation{Name: "test-client", Version: "1.0.0"}
+	result, err := c.Initialize(ctx, modern)
+	require.NoError(t, err)
+	require.Equal(t, mcp.ProtocolVersion20260728, result.ProtocolVersion)
+	_, err = c.ListTools(ctx, mcp.ListToolsRequest{})
+	require.NoError(t, err)
+}
+
+func TestHTTPClientContinuousListeningThroughLoggingTransport(t *testing.T) {
+	mcpServer := server.NewMCPServer("test-server", "1.0.0", server.WithToolCapabilities(true))
+	streamable := server.NewStreamableHTTPServer(mcpServer)
+	listening := make(chan struct{})
+	var listenOnce sync.Once
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			listenOnce.Do(func() { close(listening) })
+		}
+		streamable.ServeHTTP(w, r)
+	}))
+	defer testServer.Close()
+
+	inner, err := transport.NewStreamableHTTP(testServer.URL, transport.WithContinuousListening())
+	require.NoError(t, err)
+	client := NewClient(transport.NewLogging(inner, slog.New(slog.NewTextHandler(io.Discard, nil))))
+	defer client.Close()
+
+	notifications := make(chan string, 10)
+	client.OnNotification(func(notification mcp.JSONRPCNotification) {
+		notifications <- notification.Method
+	})
+
+	ctx := t.Context()
+	require.NoError(t, client.Start(ctx))
+	_, err = client.Initialize(ctx, mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ClientInfo: mcp.Implementation{Name: "test-client", Version: "1.0.0"},
+		},
+	})
+	require.NoError(t, err)
+
+	// Continuous listening needs the standalone GET stream, so the wrapped
+	// transport must keep the client on a legacy protocol version.
+	require.False(t, mcp.IsModernProtocol(client.ProtocolVersion()), "negotiated %s", client.ProtocolVersion())
+
+	// The session is registered at initialize and buffers notifications, so
+	// once the GET has reached the server the broadcast cannot be missed.
+	select {
+	case <-listening:
+	case <-time.After(2 * time.Second):
+		t.Fatal("client never opened the continuous listening stream")
+	}
+	mcpServer.AddTool(mcp.NewTool("late"), func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return mcp.NewToolResultText("ok"), nil
+	})
+
+	select {
+	case method := <-notifications:
+		require.Equal(t, "notifications/tools/list_changed", method)
+	case <-time.After(2 * time.Second):
+		t.Fatal("no notification received over the continuous listening stream")
+	}
 }

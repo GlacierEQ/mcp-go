@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -14,9 +15,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -583,6 +586,70 @@ func TestStreamableHTTPErrors(t *testing.T) {
 			t.Errorf("Expected error when sending request to non-existent URL, got nil")
 		}
 	})
+
+	t.Run("NonJSONRPCErrorBody", func(t *testing.T) {
+		tests := []struct {
+			name   string
+			status int
+			body   string
+		}{
+			{name: "bad gateway problem json", status: http.StatusBadGateway, body: `{"title":"Error 502: Bad gateway","status":502}`},
+			{name: "framework detail", status: http.StatusServiceUnavailable, body: `{"detail":"Service Unavailable"}`},
+			{name: "rate limited", status: http.StatusTooManyRequests, body: `{"message":"API rate limit exceeded"}`},
+			{name: "error object without jsonrpc", status: http.StatusInternalServerError, body: `{"error":{"code":-32603,"message":"boom"}}`},
+			{name: "empty error object", status: http.StatusTooManyRequests, body: `{"jsonrpc":"2.0","error":{}}`},
+			{name: "error without message", status: http.StatusBadGateway, body: `{"jsonrpc":"2.0","error":{"code":-32603}}`},
+			{name: "differently cased error member", status: http.StatusInternalServerError, body: `{"jsonrpc":"2.0","Error":{"code":-32603,"message":"failure"}}`},
+			{name: "differently cased jsonrpc member", status: http.StatusInternalServerError, body: `{"JSONRPC":"2.0","error":{"code":-32603,"message":"failure"}}`},
+			{name: "differently cased code member", status: http.StatusInternalServerError, body: `{"jsonrpc":"2.0","error":{"Code":-32603,"message":"failure"}}`},
+			{name: "null code and message", status: http.StatusInternalServerError, body: `{"jsonrpc":"2.0","error":{"code":null,"message":null}}`},
+			{name: "string code", status: http.StatusInternalServerError, body: `{"jsonrpc":"2.0","error":{"code":"-32603","message":"failure"}}`},
+			{name: "error cleared by differently cased member", status: http.StatusInternalServerError, body: `{"jsonrpc":"2.0","error":{"code":-32603,"message":"failure"},"Error":null}`},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(tt.status)
+					_, _ = w.Write([]byte(tt.body))
+				}))
+				defer server.Close()
+
+				trans, err := NewStreamableHTTP(server.URL)
+				require.NoError(t, err)
+
+				resp, err := trans.SendRequest(t.Context(), JSONRPCRequest{
+					JSONRPC: "2.0",
+					ID:      mcp.NewRequestId(int64(1)),
+					Method:  "tools/list",
+				})
+				require.Nil(t, resp)
+				require.ErrorContains(t, err, fmt.Sprintf("request failed with status %d", tt.status))
+			})
+		}
+	})
+
+	t.Run("JSONRPCErrorBody", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"internal error"}}`))
+		}))
+		defer server.Close()
+
+		trans, err := NewStreamableHTTP(server.URL)
+		require.NoError(t, err)
+
+		resp, err := trans.SendRequest(t.Context(), JSONRPCRequest{
+			JSONRPC: "2.0",
+			ID:      mcp.NewRequestId(int64(1)),
+			Method:  "tools/list",
+		})
+		require.NoError(t, err)
+		require.NotNil(t, resp.Error)
+		require.Equal(t, mcp.INTERNAL_ERROR, resp.Error.Code)
+	})
 }
 
 // ---- continuous listening tests ----
@@ -849,7 +916,7 @@ func TestContinuousListeningMethodNotAllowed(t *testing.T) {
 
 	// Setup logger to capture log messages
 	logChan := make(chan string, 10)
-	testLogger := &testLogger{logChan: logChan}
+	testLogger := newTestLogger(logChan)
 
 	// Create transport with continuous listening enabled and custom logger
 	trans, err := NewStreamableHTTP(url, WithContinuousListening(), WithLogger(testLogger))
@@ -894,16 +961,121 @@ func TestContinuousListeningMethodNotAllowed(t *testing.T) {
 	}
 }
 
+// TestContinuousListeningContentTypeWithCharset verifies that the GET
+// listening stream accepts a Content-Type carrying media-type parameters
+// (e.g. "text/event-stream; charset=utf-8"). Servers built on frameworks
+// that append a charset to text/* responses (such as the Python MCP SDK,
+// via Starlette) send exactly this header, and the stream must still be
+// treated as SSE rather than rejected as an unexpected content type.
+func TestContinuousListeningContentTypeWithCharset(t *testing.T) {
+	origRetryInterval := retryInterval
+	retryInterval = 10 * time.Millisecond
+	defer func() { retryInterval = origRetryInterval }()
+
+	var mu sync.Mutex
+	var sessionID string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			var request map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				http.Error(w, fmt.Sprintf("Invalid JSON: %v", err), http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			sessionID = "charset-test-session"
+			mu.Unlock()
+			w.Header().Set("Mcp-Session-Id", sessionID)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusAccepted)
+			if err := json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      request["id"],
+				"result":  "initialized",
+			}); err != nil {
+				http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+			}
+		case http.MethodGet:
+			mu.Lock()
+			expected := sessionID
+			mu.Unlock()
+			if recvSessionID := r.Header.Get("Mcp-Session-Id"); recvSessionID != expected {
+				http.Error(w, "Invalid session ID", http.StatusNotFound)
+				return
+			}
+			// Include a charset parameter, as Starlette-based servers do.
+			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			flusher, ok := w.(http.Flusher)
+			if !ok {
+				http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+				return
+			}
+			notification := map[string]any{
+				"jsonrpc": "2.0",
+				"method":  "test/notification",
+				"params":  map[string]any{"message": "Hello from server"},
+			}
+			notificationData, _ := json.Marshal(notification)
+			fmt.Fprintf(w, "event: message\ndata: %s\n\n", notificationData)
+			flusher.Flush()
+			<-r.Context().Done()
+		}
+	}))
+
+	trans, err := NewStreamableHTTP(server.URL, WithContinuousListening())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		trans.Close()
+		server.Close()
+	}()
+
+	notificationReceived := make(chan struct{}, 1)
+	trans.SetNotificationHandler(func(notification mcp.JSONRPCNotification) {
+		select {
+		case notificationReceived <- struct{}{}:
+		default:
+		}
+	})
+
+	if err := trans.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	initRequest := JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      mcp.NewRequestId(int64(0)),
+		Method:  "initialize",
+	}
+	if _, err := trans.SendRequest(ctx, initRequest); err != nil {
+		t.Fatal(err)
+	}
+
+	// The notification only arrives if the GET stream was accepted despite
+	// the charset parameter in the Content-Type header.
+	select {
+	case <-notificationReceived:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Timed out waiting for notification: GET stream with " +
+			"\"text/event-stream; charset=utf-8\" was not accepted")
+	}
+}
+
 func TestContinuousListeningSessionTerminated(t *testing.T) {
 	// Use a short retry interval so we can verify no retries happen quickly.
 	origRetryInterval := retryInterval
 	retryInterval = 20 * time.Millisecond
 	t.Cleanup(func() { retryInterval = origRetryInterval })
 
-	// Start a server that returns 200 on POST (initialize) but 404 on GET
-	// (simulating a server restart where the session no longer exists).
+	// Start a server that returns 200 on POST (initialize) but 404 on GET,
+	// which the listener takes as a server that doesn't offer the stream.
 	sessionID := "test-session-123"
-	var getCalls int64
+	var getCalls atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			// Handle initialize
@@ -918,7 +1090,7 @@ func TestContinuousListeningSessionTerminated(t *testing.T) {
 			return
 		}
 		if r.Method == http.MethodGet {
-			atomic.AddInt64(&getCalls, 1)
+			getCalls.Add(1)
 			// Simulate session terminated: server restarted, session gone
 			w.WriteHeader(http.StatusNotFound)
 			return
@@ -928,7 +1100,7 @@ func TestContinuousListeningSessionTerminated(t *testing.T) {
 
 	// Setup logger to capture log messages
 	logChan := make(chan string, 10)
-	testLogger := &testLogger{logChan: logChan}
+	testLogger := newTestLogger(logChan)
 
 	// Create transport with continuous listening enabled
 	trans, err := NewStreamableHTTP(server.URL, WithContinuousListening(), WithLogger(testLogger))
@@ -968,23 +1140,35 @@ func TestContinuousListeningSessionTerminated(t *testing.T) {
 
 	// Verify no further retries: wait several retry intervals and check GET count.
 	time.Sleep(5 * retryInterval)
-	calls := atomic.LoadInt64(&getCalls)
+	calls := getCalls.Load()
 	if calls != 1 {
 		t.Errorf("Expected exactly 1 GET attempt, got %d (listener retried after session termination)", calls)
 	}
 }
 
-// testLogger is a simple logger for testing
-type testLogger struct {
+// channelHandler is a slog.Handler that forwards every ERROR record's
+// message into a channel so tests can assert on emitted errors without
+// scraping stderr.
+type channelHandler struct {
 	logChan chan string
 }
 
-func (l *testLogger) Infof(format string, args ...any) {
-	// Intentionally left empty
+func (h *channelHandler) Enabled(_ context.Context, level slog.Level) bool {
+	return level >= slog.LevelError
 }
 
-func (l *testLogger) Errorf(format string, args ...any) {
-	l.logChan <- fmt.Sprintf(format, args...)
+func (h *channelHandler) Handle(_ context.Context, r slog.Record) error {
+	h.logChan <- r.Message
+	return nil
+}
+
+func (h *channelHandler) WithAttrs(_ []slog.Attr) slog.Handler { return h }
+func (h *channelHandler) WithGroup(_ string) slog.Handler      { return h }
+
+// newTestLogger returns a *slog.Logger that pushes error messages onto the
+// given channel; matches the old testLogger semantics.
+func newTestLogger(logChan chan string) *slog.Logger {
+	return slog.New(&channelHandler{logChan: logChan})
 }
 
 func TestStreamableHTTP_Unauthorized_StaticToken(t *testing.T) {
@@ -1333,11 +1517,10 @@ func TestReadSSEContextCancellation(t *testing.T) {
 	c := &StreamableHTTP{}
 
 	handlerCalled := make(chan struct{}, 1)
-	done := make(chan struct{})
+	done := make(chan error, 1)
 
 	go func() {
-		defer close(done)
-		c.readSSE(ctx, pr, func(event, data string) {
+		done <- c.readSSE(ctx, pr, func(event, data string) {
 			handlerCalled <- struct{}{}
 		})
 	}()
@@ -1348,8 +1531,8 @@ func TestReadSSEContextCancellation(t *testing.T) {
 
 	// readSSE must exit within 1 second after cancellation
 	select {
-	case <-done:
-		// Success — readSSE exited promptly
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
 	case <-time.After(2 * time.Second):
 		t.Fatal("readSSE did not exit within 2 seconds after context cancellation — blocking I/O is not interrupted")
 	}
@@ -1495,4 +1678,367 @@ func TestSendRequestSSEStreamStaysOpenWithContinuousListening(t *testing.T) {
 	resp2, err := trans.SendRequest(ctx, listReq)
 	require.NoError(t, err, "tools/list should not hang even with continuous listening against stateless server")
 	require.NotNil(t, resp2)
+}
+
+func TestNextReconnectDelay(t *testing.T) {
+	const maxDuration = time.Duration(1<<63 - 1)
+	tests := []struct {
+		name      string
+		current   time.Duration
+		baseDelay time.Duration
+		maxDelay  time.Duration
+		expected  time.Duration
+	}{
+		{
+			name:      "backoff disabled keeps base delay",
+			current:   retryInterval,
+			baseDelay: retryInterval,
+			maxDelay:  0,
+			expected:  retryInterval,
+		},
+		{
+			name:      "delay doubles",
+			current:   time.Second,
+			baseDelay: time.Second,
+			maxDelay:  30 * time.Second,
+			expected:  2 * time.Second,
+		},
+		{
+			name:      "delay capped at max",
+			current:   20 * time.Second,
+			baseDelay: time.Second,
+			maxDelay:  30 * time.Second,
+			expected:  30 * time.Second,
+		},
+		{
+			name:      "delay stays at max",
+			current:   30 * time.Second,
+			baseDelay: time.Second,
+			maxDelay:  30 * time.Second,
+			expected:  30 * time.Second,
+		},
+		{
+			name:      "negative maximum keeps base delay",
+			current:   maxDuration,
+			baseDelay: time.Second,
+			maxDelay:  -time.Second,
+			expected:  time.Second,
+		},
+		{
+			name:      "disabled backoff ignores overflowing current",
+			current:   maxDuration,
+			baseDelay: time.Second,
+			maxDelay:  0,
+			expected:  time.Second,
+		},
+		{
+			name:      "maximum duration saturates",
+			current:   maxDuration,
+			baseDelay: time.Second,
+			maxDelay:  maxDuration,
+			expected:  maxDuration,
+		},
+		{
+			name:      "just below half of maximum doubles",
+			current:   maxDuration/2 - 1,
+			baseDelay: time.Second,
+			maxDelay:  maxDuration,
+			expected:  maxDuration - 3,
+		},
+		{
+			name:      "half of odd maximum doubles",
+			current:   maxDuration / 2,
+			baseDelay: time.Second,
+			maxDelay:  maxDuration,
+			expected:  maxDuration - 1,
+		},
+		{
+			name:      "just above half of maximum saturates",
+			current:   maxDuration/2 + 1,
+			baseDelay: time.Second,
+			maxDelay:  maxDuration,
+			expected:  maxDuration,
+		},
+		{
+			name:      "overflowing current saturates at smaller maximum",
+			current:   maxDuration,
+			baseDelay: time.Second,
+			maxDelay:  30 * time.Second,
+			expected:  30 * time.Second,
+		},
+		{
+			name:      "half of even maximum reaches cap",
+			current:   5 * time.Nanosecond,
+			baseDelay: time.Second,
+			maxDelay:  10 * time.Nanosecond,
+			expected:  10 * time.Nanosecond,
+		},
+		{
+			name:      "above half of odd maximum saturates",
+			current:   5 * time.Nanosecond,
+			baseDelay: time.Second,
+			maxDelay:  9 * time.Nanosecond,
+			expected:  9 * time.Nanosecond,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.expected, nextReconnectDelay(tt.current, tt.baseDelay, tt.maxDelay))
+		})
+	}
+}
+
+func TestWithContinuousListeningBackoffOption(t *testing.T) {
+	trans, err := NewStreamableHTTP("http://example.com/mcp",
+		WithContinuousListening(),
+		WithContinuousListeningBackoff(2*time.Second, time.Minute),
+	)
+	require.NoError(t, err)
+	require.Equal(t, 2*time.Second, trans.reconnectInitialDelay)
+	require.Equal(t, time.Minute, trans.reconnectMaxDelay)
+}
+
+func TestContinuousListeningBackoffIncreasesRetryDelay(t *testing.T) {
+	var mu sync.Mutex
+	var getTimes []time.Time
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set(HeaderKeySessionID, "test-session-backoff")
+			resp := JSONRPCResponse{
+				JSONRPC: "2.0",
+				ID:      mcp.NewRequestId(int64(0)),
+				Result:  json.RawMessage(`{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"test"}}`),
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+		mu.Lock()
+		getTimes = append(getTimes, time.Now())
+		count := len(getTimes)
+		mu.Unlock()
+		if count <= 4 {
+			// Fail the first four GET attempts so the listener backs off.
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer server.Close()
+
+	trans, err := NewStreamableHTTP(server.URL,
+		WithContinuousListening(),
+		WithContinuousListeningBackoff(40*time.Millisecond, 320*time.Millisecond),
+		WithHTTPLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+	)
+	require.NoError(t, err)
+	defer trans.Close()
+
+	require.NoError(t, trans.Start(t.Context()))
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	_, err = trans.SendRequest(ctx, JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      mcp.NewRequestId(int64(0)),
+		Method:  "initialize",
+	})
+	require.NoError(t, err)
+
+	// Wait for five GET attempts (four failures with growing delays).
+	var times []time.Time
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		mu.Lock()
+		n := len(getTimes)
+		times = append([]time.Time(nil), getTimes...)
+		mu.Unlock()
+		if n >= 5 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for GET attempts, got %d", n)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	interval := func(i, j int) time.Duration { return times[j].Sub(times[i]) }
+	// Expected delays between attempts: 40ms, 80ms, 160ms, 320ms.
+	// Assert lower bounds slightly below the expected values to tolerate
+	// timer granularity, and require the delay to actually grow.
+	require.GreaterOrEqual(t, interval(0, 1), 30*time.Millisecond)
+	require.GreaterOrEqual(t, interval(1, 2), 60*time.Millisecond)
+	require.GreaterOrEqual(t, interval(2, 3), 120*time.Millisecond)
+	require.GreaterOrEqual(t, interval(3, 4), 240*time.Millisecond)
+	require.Greater(t, interval(2, 3), interval(0, 1))
+}
+
+func TestContinuousListeningCleanStreamEndDoesNotAdvanceBackoff(t *testing.T) {
+	var mu sync.Mutex
+	var getTimes []time.Time
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set(HeaderKeySessionID, "test-session-clean-eof")
+			resp := JSONRPCResponse{
+				JSONRPC: "2.0",
+				ID:      mcp.NewRequestId(int64(0)),
+				Result:  json.RawMessage(`{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"test"}}`),
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+		mu.Lock()
+		getTimes = append(getTimes, time.Now())
+		count := len(getTimes)
+		mu.Unlock()
+		// Disable keep-alive so the Go transport never silently retries a GET
+		// on a race-closed pooled connection, which would skew timing below.
+		w.Header().Set("Connection", "close")
+		switch count {
+		case 1:
+			// End the SSE stream cleanly right away (server closes the connection).
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		case 2, 3:
+			// Fail the next attempts so the listener backs off from baseDelay again.
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	trans, err := NewStreamableHTTP(server.URL,
+		WithContinuousListening(),
+		WithContinuousListeningBackoff(40*time.Millisecond, 320*time.Millisecond),
+		WithHTTPLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+	)
+	require.NoError(t, err)
+	defer trans.Close()
+
+	require.NoError(t, trans.Start(t.Context()))
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	_, err = trans.SendRequest(ctx, JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      mcp.NewRequestId(int64(0)),
+		Method:  "initialize",
+	})
+	require.NoError(t, err)
+
+	// Wait for four GET attempts: clean EOF, two failures, then stop.
+	var times []time.Time
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		mu.Lock()
+		n := len(getTimes)
+		times = append([]time.Time(nil), getTimes...)
+		mu.Unlock()
+		if n >= 4 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for GET attempts, got %d", n)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	interval := func(i, j int) time.Duration { return times[j].Sub(times[i]) }
+	// A clean EOF is a success: the listener reconnects after baseDelay (40ms).
+	require.GreaterOrEqual(t, interval(0, 1), 30*time.Millisecond)
+	require.Less(t, interval(0, 1), 75*time.Millisecond)
+	// The first failure after a success also waits baseDelay (the delay is
+	// advanced only after the wait), then the backoff grows from baseDelay:
+	// the second failure waits 80ms.
+	require.GreaterOrEqual(t, interval(1, 2), 30*time.Millisecond)
+	require.Less(t, interval(1, 2), 75*time.Millisecond)
+	require.GreaterOrEqual(t, interval(2, 3), 60*time.Millisecond)
+	require.Greater(t, interval(2, 3), interval(1, 2))
+}
+
+func TestStreamableHTTP_SendRequestDoesNotMutateCallerHeader(t *testing.T) {
+	url, closeF := startMockStreamableHTTPServer()
+	defer closeF()
+
+	trans, err := NewStreamableHTTP(url, WithHTTPHeaders(map[string]string{
+		"Authorization": "Bearer secret",
+	}))
+	require.NoError(t, err)
+	defer trans.Close()
+
+	shared := http.Header{"X-Tenant": []string{"acme"}}
+
+	var wg sync.WaitGroup
+	for i := range 8 {
+		wg.Go(func() {
+			resp, err := trans.SendRequest(t.Context(), JSONRPCRequest{
+				JSONRPC: "2.0",
+				ID:      mcp.NewRequestId(int64(i)),
+				Method:  "debug/echo_header",
+				Header:  shared,
+			})
+			if assert.NoError(t, err) {
+				assert.Contains(t, string(resp.Result), "acme")
+			}
+		})
+	}
+	wg.Wait()
+
+	require.Equal(t, http.Header{"X-Tenant": []string{"acme"}}, shared)
+}
+
+func TestStreamableHTTP_PreservesSSEReadErrors(t *testing.T) {
+	readErr := errors.New("broken SSE stream")
+	for _, resumed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("resumed=%t", resumed), func(t *testing.T) {
+			gets := 0
+			trans, err := NewStreamableHTTP("http://example.com/mcp", WithHTTPBasicClient(&http.Client{
+				Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+					gets++
+					assert.Equal(t, http.MethodGet, request.Method)
+					assert.Equal(t, "1", request.Header.Get("Last-Event-ID"))
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": {"text/event-stream"}},
+						Body:       io.NopCloser(iotest.ErrReader(readErr)),
+					}, nil
+				}),
+			}), WithHTTPLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
+			require.NoError(t, err)
+			trans.SetProtocolVersion(mcp.ProtocolVersion20251125)
+
+			reader := iotest.ErrReader(readErr)
+			if resumed {
+				reader = strings.NewReader("id: 1\nretry: 0\n\n")
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			_, err = trans.handleSSEResponse(ctx, io.NopCloser(reader), false)
+			require.ErrorIs(t, err, readErr)
+			if resumed {
+				assert.Equal(t, 1, gets)
+			} else {
+				assert.Zero(t, gets)
+			}
+		})
+	}
+}
+
+// TestReadSSEEventTypeResetsAfterDatalessEvent verifies a stale event type
+// does not leak into the next event when the previous event carried no data.
+func TestReadSSEEventTypeResetsAfterDatalessEvent(t *testing.T) {
+	c := &StreamableHTTP{}
+	var events []string
+	body := "event: ping\n\n" +
+		"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n"
+	err := c.readSSE(t.Context(), io.NopCloser(strings.NewReader(body)), func(event, data string) {
+		events = append(events, event)
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"message"}, events)
 }

@@ -8,10 +8,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
+	"golang.org/x/text/language"
+	"golang.org/x/text/message"
 
 	"github.com/mark3labs/mcp-go/mcp"
 )
@@ -184,11 +187,13 @@ func schemaJSONFor(tool mcp.Tool) ([]byte, bool) {
 	if len(tool.RawInputSchema) > 0 {
 		return tool.RawInputSchema, true
 	}
-	if tool.InputSchema.Type == "" && len(tool.InputSchema.Properties) == 0 && len(tool.InputSchema.Required) == 0 && tool.InputSchema.AdditionalProperties == nil {
+	if tool.InputSchema.Type == "" && tool.InputSchema.Types == nil && len(tool.InputSchema.Properties) == 0 && len(tool.InputSchema.Required) == 0 && tool.InputSchema.AdditionalProperties == nil {
 		return nil, false
 	}
-	data, err := json.Marshal(tool.InputSchema)
-	if err != nil {
+	// MarshalJSON already returns compact, HTML-escaped JSON. Check validity
+	// (including nesting depth) without copying the encoded schema again.
+	data, err := tool.InputSchema.MarshalJSON()
+	if err != nil || !json.Valid(data) {
 		return nil, false
 	}
 	return data, true
@@ -202,7 +207,9 @@ func compileSchema(toolName string, schemaJSON []byte) (*jsonschema.Schema, erro
 	if err != nil {
 		return nil, fmt.Errorf("decode tool %q input schema: %w", toolName, err)
 	}
-	resourceURL := fmt.Sprintf("mem:///mcp-go/tools/%s/input-schema.json", toolName)
+	// The name is escaped so that characters such as '#' and '%' cannot change
+	// how the URL is parsed.
+	resourceURL := fmt.Sprintf("mem:///mcp-go/tools/%s/input-schema.json", url.PathEscape(toolName))
 	c := jsonschema.NewCompiler()
 	if err := c.AddResource(resourceURL, doc); err != nil {
 		return nil, fmt.Errorf("register tool %q input schema: %w", toolName, err)
@@ -224,10 +231,11 @@ func normalizeArgumentsForValidation(rawArgs any) (any, error) {
 		return map[string]any{}, nil
 	}
 	if raw, ok := rawArgs.(json.RawMessage); ok {
-		if len(bytes.TrimSpace(raw)) == 0 {
+		trimmed := bytes.TrimSpace(raw)
+		if len(trimmed) == 0 {
 			return map[string]any{}, nil
 		}
-		return jsonschema.UnmarshalJSON(bytes.NewReader(raw))
+		return jsonschema.UnmarshalJSON(bytes.NewReader(trimmed))
 	}
 	encoded, err := json.Marshal(rawArgs)
 	if err != nil {
@@ -274,7 +282,7 @@ func formatLeafMessage(verr *jsonschema.ValidationError) string {
 	if location == "" {
 		location = "<root>"
 	}
-	return fmt.Sprintf("%s: %s", location, verr.ErrorKind)
+	return fmt.Sprintf("%s: %s", location, verr.ErrorKind.LocalizedString(message.NewPrinter(language.English)))
 }
 
 // jsonPointer renders a list of path segments as a RFC 6901 JSON Pointer.

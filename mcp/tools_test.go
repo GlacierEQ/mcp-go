@@ -401,6 +401,7 @@ func TestToolWithAny(t *testing.T) {
 	}
 }
 
+// TestParseToolCallToolRequest checks helper result types and invalid integer defaults.
 func TestParseToolCallToolRequest(t *testing.T) {
 	request := CallToolRequest{}
 	request.Params.Name = "test-tool"
@@ -431,9 +432,11 @@ func TestParseToolCallToolRequest(t *testing.T) {
 
 	param4 := ParseInt16(request, "int16_value", 1)
 	assert.Equal(t, fmt.Sprintf("%T", param4), "int16")
+	assert.Equal(t, int16(1), param4)
 
 	param5 := ParseInt8(request, "int8_value", 1)
 	assert.Equal(t, fmt.Sprintf("%T", param5), "int8")
+	assert.Equal(t, int8(1), param5)
 
 	param6 := ParseInt(request, "int_value", 1)
 	assert.Equal(t, fmt.Sprintf("%T", param6), "int")
@@ -449,9 +452,11 @@ func TestParseToolCallToolRequest(t *testing.T) {
 
 	param10 := ParseUInt16(request, "uint16_value", 1)
 	assert.Equal(t, fmt.Sprintf("%T", param10), "uint16")
+	assert.Equal(t, uint16(1), param10)
 
 	param11 := ParseUInt8(request, "uint8_value", 1)
 	assert.Equal(t, fmt.Sprintf("%T", param11), "uint8")
+	assert.Equal(t, uint8(1), param11)
 
 	param12 := ParseFloat32(request, "float32_value", 1.0)
 	assert.Equal(t, fmt.Sprintf("%T", param12), "float32")
@@ -464,6 +469,7 @@ func TestParseToolCallToolRequest(t *testing.T) {
 
 	param15 := ParseInt64(request, "string_value", 1)
 	assert.Equal(t, fmt.Sprintf("%T", param15), "int64")
+	assert.Equal(t, int64(1), param15)
 	t.Logf("param15 type: %T,value:%v", param15, param15)
 }
 
@@ -766,7 +772,7 @@ func TestToolWithInputSchema(t *testing.T) {
 // function prints an error to stderr if a jsonschema tag is invalid.
 func TestToolWithInputSchemaJsonSchemaTagError(t *testing.T) {
 	type TestInput struct {
-		Name  string `json:"name" jsonschema:"description=Person's name"` // Invalid jsonschema tag
+		Name  string `json:"name" jsonschema:""` // Invalid jsonschema tag
 		Age   int    `json:"age" jsonschema:"Person's age"`
 		Email string `json:"email,omitempty" jsonschema:"Email address"`
 	}
@@ -901,7 +907,7 @@ func TestToolWithOutputSchema(t *testing.T) {
 // function prints an error to stderr if a jsonschema tag is invalid.
 func TestToolWithOutputSchemaJsonSchemaTagError(t *testing.T) {
 	type TestOutput struct {
-		Name  string `json:"name" jsonschema:"description=Person's name"` // Invalid jsonschema tag
+		Name  string `json:"name" jsonschema:""` // Invalid jsonschema tag
 		Age   int    `json:"age" jsonschema:"Person's age"`
 		Email string `json:"email,omitempty" jsonschema:"Email address"`
 	}
@@ -1832,6 +1838,53 @@ func TestToolArgumentsSchema_UnmarshalWithDefinitions(t *testing.T) {
 	assert.NotNil(t, operationType["enum"])
 }
 
+func TestToolArgumentsSchema_DefinitionsRoundTripKeepsRefsResolvable(t *testing.T) {
+	// A draft-07 schema whose properties $ref into "definitions". Marshaling
+	// re-emits Defs as "$defs", so unmarshal must rewrite local refs or the
+	// round-tripped schema carries dangling "#/definitions/..." pointers that
+	// strict validators (e.g. xAI) reject.
+	jsonData := `{
+		"type": "object",
+		"properties": {
+			"body": {
+				"allOf": [{"$ref": "#/definitions/json_value"}]
+			}
+		},
+		"definitions": {
+			"json_value": {
+				"anyOf": [
+					{"type": "string"},
+					{"type": "array", "items": {"$ref": "#/definitions/json_value"}}
+				]
+			}
+		}
+	}`
+
+	var schema ToolArgumentsSchema
+	require.NoError(t, json.Unmarshal([]byte(jsonData), &schema))
+
+	out, err := json.Marshal(schema)
+	require.NoError(t, err)
+	assert.NotContains(t, string(out), "#/definitions/",
+		"round-tripped schema must not reference the renamed definitions key")
+
+	var roundTripped map[string]any
+	require.NoError(t, json.Unmarshal(out, &roundTripped))
+	defs, ok := roundTripped["$defs"].(map[string]any)
+	require.True(t, ok, "definitions must be re-emitted as $defs")
+	assert.Contains(t, defs, "json_value")
+
+	properties, ok := roundTripped["properties"].(map[string]any)
+	require.True(t, ok)
+	body, ok := properties["body"].(map[string]any)
+	require.True(t, ok)
+	allOf, ok := body["allOf"].([]any)
+	require.True(t, ok)
+	ref, ok := allOf[0].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "#/$defs/json_value", ref["$ref"])
+}
+
 func TestToolArgumentsSchema_UnmarshalWithDefs(t *testing.T) {
 	// Test that "$defs" (JSON Schema 2019-09+) is properly unmarshaled into Defs field
 	jsonData := `{
@@ -2670,4 +2723,77 @@ func TestCallToolRequest_WithTaskParams_RoundTrip(t *testing.T) {
 	// Compare task params
 	assert.NotNil(t, unmarshaled.Params.Task)
 	assert.Equal(t, original.Params.Task.TTL, unmarshaled.Params.Task.TTL)
+}
+
+func TestCallToolParamsPreservesLargeIntegerArguments(t *testing.T) {
+	raw := []byte(`{"name":"t","arguments":{"id":9223372036854775807}}`)
+	var params CallToolParams
+	err := json.Unmarshal(raw, &params)
+	require.NoError(t, err)
+
+	rawArgs, ok := CallToolRequest{Params: params}.GetRawArguments().(json.RawMessage)
+	assert.True(t, ok)
+	assert.Contains(t, string(rawArgs), `"id":9223372036854775807`)
+
+	out, err := json.Marshal(params)
+	require.NoError(t, err)
+	assert.Contains(t, string(out), `"id":9223372036854775807`)
+
+	type args struct {
+		ID int64 `json:"id"`
+	}
+	var bound args
+	err = CallToolRequest{Params: params}.BindArguments(&bound)
+	require.NoError(t, err)
+	assert.Equal(t, int64(9223372036854775807), bound.ID)
+}
+
+func TestCallToolParamsReplacesArgumentsWhenReused(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		args map[string]any
+	}{
+		{name: "omitted", raw: `{"name":"next"}`},
+		{name: "null", raw: `{"name":"next","arguments":null}`},
+		{name: "empty object", raw: `{"name":"next","arguments":{}}`, args: map[string]any{}},
+		{name: "new object", raw: `{"name":"next","arguments":{"fresh":"value"}}`, args: map[string]any{"fresh": "value"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var request CallToolRequest
+			require.NoError(t, json.Unmarshal([]byte(`{"params":{"name":"previous","arguments":{"stale":"value"}}}`), &request))
+			require.NoError(t, json.Unmarshal([]byte(`{"params":`+tt.raw+`}`), &request))
+
+			assert.Equal(t, "next", request.Params.Name)
+			assert.Equal(t, tt.args, request.GetArguments())
+			var bound map[string]any
+			require.NoError(t, request.BindArguments(&bound))
+			assert.Equal(t, tt.args, bound)
+			out, err := json.Marshal(request.Params)
+			require.NoError(t, err)
+			assert.JSONEq(t, tt.raw, string(out))
+		})
+	}
+}
+
+func TestCallToolResultPreservesLargeIntegerStructuredContent(t *testing.T) {
+	raw := []byte(`{
+		"content": [{"type": "text", "text": "ok"}],
+		"structuredContent": {"id": 9223372036854775807}
+	}`)
+
+	var result CallToolResult
+	err := json.Unmarshal(raw, &result)
+	require.NoError(t, err)
+	assert.Contains(t, string(result.RawStructuredContent), "9223372036854775807")
+
+	out, err := json.Marshal(result)
+	require.NoError(t, err)
+	assert.Contains(t, string(out), "9223372036854775807")
+	assert.NotContains(t, string(out), "9223372036854776000")
+
+	parsed, err := ParseCallToolResult((*json.RawMessage)(&raw))
+	require.NoError(t, err)
+	assert.Contains(t, string(parsed.RawStructuredContent), "9223372036854775807")
 }

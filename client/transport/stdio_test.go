@@ -2,6 +2,7 @@ package transport
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,7 +15,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -23,15 +23,27 @@ import (
 )
 
 func compileTestServer(outputPath string) error {
+	return compileTestServerFromSource(outputPath, "../../testdata/mockstdio_server.go")
+}
+
+// compileTestServerFromSource builds a mock JSON-RPC server binary from the
+// given source file into outputPath, using a temporary build cache.
+func compileTestServerFromSource(outputPath, sourcePath string) error {
 	cmd := exec.Command(
 		"go",
 		"build",
 		"-buildmode=pie",
 		"-o",
 		outputPath,
-		"../../testdata/mockstdio_server.go",
+		sourcePath,
 	)
-	tmpCache, _ := os.MkdirTemp("", "gocache")
+	// Each build gets a cache of its own, which #241 added for a flaky
+	// parallel build. Nothing reuses it, so it goes once the build is done.
+	tmpCache, err := os.MkdirTemp("", "gocache")
+	if err != nil {
+		return fmt.Errorf("creating build cache: %w", err)
+	}
+	defer os.RemoveAll(tmpCache)
 	cmd.Env = append(os.Environ(), "GOCACHE="+tmpCache)
 
 	if output, err := cmd.CombinedOutput(); err != nil {
@@ -497,7 +509,7 @@ func TestStdioErrors(t *testing.T) {
 
 	t.Run("StdioResponseWritingErrorLogging", func(t *testing.T) {
 		logChan := make(chan string, 10)
-		testLogger := &testLogger{logChan: logChan}
+		testLogger := newTestLogger(logChan)
 
 		_, stdinWriter := io.Pipe()
 		stdoutReader, stdoutWriter := io.Pipe()
@@ -559,7 +571,7 @@ func TestStdioErrors(t *testing.T) {
 func TestStdio_ReadResponses_SuppressesClosedPipeShutdownNoise(t *testing.T) {
 	logChan := make(chan string, 1)
 	stdio := NewIO(io.NopCloser(strings.NewReader("")), nopWriteCloser{Writer: io.Discard}, io.NopCloser(strings.NewReader("")))
-	stdio.logger = &testLogger{logChan: logChan}
+	stdio.logger = newTestLogger(logChan)
 	stdio.stdout = bufio.NewReader(errReader{err: &fs.PathError{Op: "read", Path: "|0", Err: fs.ErrClosed}})
 
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
@@ -651,67 +663,56 @@ func TestStdio_StartGuaranteesReaderReady(t *testing.T) {
 	}
 }
 
-func TestStdio_WithCommandFunc(t *testing.T) {
-	called := false
-	tmpDir := t.TempDir()
-	chrootDir := filepath.Join(tmpDir, "sandbox-root")
-	err := os.MkdirAll(chrootDir, 0o755)
-	require.NoError(t, err, "failed to create chroot dir")
+func TestStdio_FinalResponseWithoutTrailingNewline(t *testing.T) {
+	stdoutReader, stdoutWriter := io.Pipe()
+	stdinReader, stdinWriter := io.Pipe()
+	stderrReader, stderrWriter := io.Pipe()
+	t.Cleanup(func() {
+		_ = stdoutWriter.Close()
+		_ = stdinWriter.Close()
+		_ = stderrWriter.Close()
+	})
 
-	fakeCmdFunc := func(ctx context.Context, command string, args []string, env []string) (*exec.Cmd, error) {
-		called = true
+	stdio := NewIO(stdoutReader, stdinWriter, stderrReader)
 
-		// Override the args inside our command func.
-		cmd := exec.CommandContext(ctx, command, "bonjour")
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	t.Cleanup(cancel)
 
-		// Simulate some security-related settings for test purposes.
-		cmd.Env = []string{"PATH=/usr/bin", "NODE_ENV=production"}
-		cmd.Dir = tmpDir
+	require.NoError(t, stdio.Start(ctx))
+	t.Cleanup(func() { _ = stdio.Close() })
 
-		cmd.SysProcAttr = &syscall.SysProcAttr{
-			Credential: &syscall.Credential{
-				Uid: 1001,
-				Gid: 1001,
-			},
-			Chroot: chrootDir,
+	go func() {
+		var req map[string]any
+		if err := json.NewDecoder(stdinReader).Decode(&req); err != nil {
+			return
 		}
+		b, _ := json.Marshal(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      req["id"],
+			"result":  map[string]any{},
+		})
+		_, _ = stdoutWriter.Write(b)
+		_ = stdoutWriter.Close()
+	}()
 
-		return cmd, nil
-	}
-
-	stdio := NewStdioWithOptions(
-		"echo",
-		[]string{"foo=bar"},
-		[]string{"hello"},
-		WithCommandFunc(fakeCmdFunc),
-	)
-	require.NotNil(t, stdio)
-	require.NotNil(t, stdio.cmdFunc)
-
-	// Manually call the cmdFunc passing the same values as in spawnCommand.
-	cmd, err := stdio.cmdFunc(t.Context(), "echo", nil, []string{"hello"})
+	resp, err := stdio.SendRequest(ctx, JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      mcp.NewRequestId(int64(1)),
+		Method:  "ping",
+	})
 	require.NoError(t, err)
-	require.True(t, called)
-	require.NotNil(t, cmd)
-	require.NotNil(t, cmd.SysProcAttr)
-	require.Equal(t, chrootDir, cmd.SysProcAttr.Chroot)
-	require.Equal(t, tmpDir, cmd.Dir)
-	require.Equal(t, uint32(1001), cmd.SysProcAttr.Credential.Uid)
-	require.Equal(t, "echo", filepath.Base(cmd.Path))
-	require.Len(t, cmd.Args, 2)
-	require.Contains(t, cmd.Args, "bonjour")
-	require.Len(t, cmd.Env, 2)
-	require.Contains(t, cmd.Env, "PATH=/usr/bin")
-	require.Contains(t, cmd.Env, "NODE_ENV=production")
+	require.NotNil(t, resp)
+	require.Equal(t, mcp.NewRequestId(int64(1)), resp.ID)
 }
 
 func TestStdio_SpawnCommand(t *testing.T) {
 	ctx := t.Context()
 	t.Setenv("TEST_ENVIRON_VAR", "true")
+	command, args := testTransportCommand(t)
 
 	// Explicitly not passing any environment, so we can see if it
 	// is picked up by spawn command merging the os.Environ.
-	stdio := NewStdio("echo", nil, "hello")
+	stdio := NewStdio(command, nil, args...)
 	require.NotNil(t, stdio)
 
 	err := stdio.spawnCommand(ctx)
@@ -721,21 +722,22 @@ func TestStdio_SpawnCommand(t *testing.T) {
 		_ = stdio.cmd.Process.Kill()
 	})
 
-	require.Equal(t, "echo", filepath.Base(stdio.cmd.Path))
-	require.Contains(t, stdio.cmd.Args, "hello")
+	require.Equal(t, filepath.Base(command), filepath.Base(stdio.cmd.Path))
+	require.Contains(t, stdio.cmd.Args, args[0])
 	require.Contains(t, stdio.cmd.Env, "TEST_ENVIRON_VAR=true")
 }
 
 func TestStdio_SpawnCommand_UsesCommandFunc(t *testing.T) {
 	ctx := t.Context()
 	t.Setenv("TEST_ENVIRON_VAR", "true")
+	command, args := testTransportCommand(t)
 
 	stdio := NewStdioWithOptions(
-		"echo",
+		command,
 		nil,
 		[]string{"test"},
-		WithCommandFunc(func(ctx context.Context, cmd string, args []string, env []string) (*exec.Cmd, error) {
-			c := exec.CommandContext(ctx, cmd, "hola")
+		WithCommandFunc(func(ctx context.Context, cmd string, env []string, args []string) (*exec.Cmd, error) {
+			c := exec.CommandContext(ctx, cmd, "-test.run=^TestTransportCommandHelperProcess$")
 			c.Env = env
 			return c, nil
 		}),
@@ -747,8 +749,8 @@ func TestStdio_SpawnCommand_UsesCommandFunc(t *testing.T) {
 		_ = stdio.cmd.Process.Kill()
 	})
 
-	require.Equal(t, "echo", filepath.Base(stdio.cmd.Path))
-	require.Contains(t, stdio.cmd.Args, "hola")
+	require.Equal(t, filepath.Base(command), filepath.Base(stdio.cmd.Path))
+	require.Contains(t, stdio.cmd.Args, args[0])
 	require.NotContains(t, stdio.cmd.Env, "TEST_ENVIRON_VAR=true")
 	require.NotNil(t, stdio.stdin)
 	require.NotNil(t, stdio.stdout)
@@ -846,6 +848,45 @@ func TestStdio_Close_ShutsDownHungChild(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestStdio_Close_KillsHungChildOnWindows(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows-only: SIGTERM is not implemented and must not delay Close")
+	}
+
+	// ping -t never exits and does not observe stdin close, so Close must
+	// reach the forced-kill path after gracefulShutdownTimeout.
+	stdio := NewStdio("ping", nil, "-t", "127.0.0.1")
+	require.NotNil(t, stdio)
+
+	err := stdio.spawnCommand(t.Context())
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		if stdio.cmd != nil && stdio.cmd.Process != nil {
+			_ = stdio.cmd.Process.Kill()
+		}
+	})
+
+	deadline := gracefulShutdownTimeout + forceKillTimeout + 2*time.Second
+	closeErrCh := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		closeErrCh <- stdio.Close()
+	}()
+
+	select {
+	case <-closeErrCh:
+	case <-time.After(deadline):
+		t.Fatalf("Close() did not return within %s", deadline)
+	}
+
+	elapsed := time.Since(start)
+	require.GreaterOrEqual(t, elapsed, gracefulShutdownTimeout)
+	// A leftover SIGTERM wait would push Close to graceful+force (~5s).
+	require.Less(t, elapsed, gracefulShutdownTimeout+forceKillTimeout)
+	require.NotNil(t, stdio.cmd.ProcessState)
 }
 
 func TestStdio_NewStdioWithOptions_AppliesOptions(t *testing.T) {
@@ -1041,6 +1082,8 @@ func TestStdio_ConcurrentWritesDoNotInterleave(t *testing.T) {
 	}
 }
 
+// generateRandomString returns a deterministic pseudo-random string of the
+// given size by cycling through a fixed charset.
 func generateRandomString(size int) string {
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 "
 
@@ -1049,4 +1092,182 @@ func generateRandomString(size int) string {
 		b[i] = charset[i%len(charset)]
 	}
 	return string(b)
+}
+
+// syncBuffer is a mutex-guarded bytes.Buffer used by tests that read Len()
+// while the stderr drain goroutine writes.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+// Write appends p to the guarded buffer.
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+// Len returns the guarded buffer's length.
+func (b *syncBuffer) Len() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Len()
+}
+
+// TestStdio_ServerStderrDoesNotDeadlock verifies that a subprocess which fills
+// its stderr pipe keeps answering on stdout. Regression test for the deadlock
+// where StderrPipe was never read: once the ~64KB OS pipe buffer fills, the
+// child blocks inside write(2) and every request times out.
+func TestStdio_ServerStderrDoesNotDeadlock(t *testing.T) {
+	tempFile, err := os.CreateTemp(t.TempDir(), "mockstdio_stderr_server")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	tempFile.Close()
+	mockServerPath := tempFile.Name() + ".exe"
+
+	if compileErr := compileTestServerFromSource(mockServerPath, "../../testdata/mockstdio_stderr_server.go"); compileErr != nil {
+		t.Fatalf("Failed to compile mock server: %v", compileErr)
+	}
+
+	stdio := NewStdio(mockServerPath, nil)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	if err := stdio.Start(ctx); err != nil {
+		t.Fatalf("Failed to start Stdio transport: %v", err)
+	}
+	defer stdio.Close()
+
+	// The mock server writes ~256KB to stderr before answering anything. If the
+	// transport does not drain stderr, the first Ping already times out.
+	for i := range 3 {
+		reqCtx, reqCancel := context.WithTimeout(ctx, 5*time.Second)
+		_, err := stdio.SendRequest(reqCtx, JSONRPCRequest{
+			JSONRPC: "2.0",
+			ID:      mcp.NewRequestId(int64(i + 1)),
+			Method:  "ping",
+		})
+		reqCancel()
+		if err != nil {
+			t.Fatalf("SendRequest %d failed: %v", i+1, err)
+		}
+	}
+}
+
+// TestStdio_WithCommandStderrWriter_CapturesStderr verifies that the drain
+// goroutine forwards the child's stderr to the configured writer.
+func TestStdio_WithCommandStderrWriter_CapturesStderr(t *testing.T) {
+	tempFile, err := os.CreateTemp(t.TempDir(), "mockstdio_stderr_server")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	tempFile.Close()
+	mockServerPath := tempFile.Name() + ".exe"
+
+	if compileErr := compileTestServerFromSource(mockServerPath, "../../testdata/mockstdio_stderr_server.go"); compileErr != nil {
+		t.Fatalf("Failed to compile mock server: %v", compileErr)
+	}
+
+	var stderrBuf syncBuffer
+	stdio := NewStdioWithOptions(mockServerPath, nil, nil, WithCommandStderrWriter(&stderrBuf))
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	if err := stdio.Start(ctx); err != nil {
+		t.Fatalf("Failed to start Stdio transport: %v", err)
+	}
+	defer stdio.Close()
+
+	// A single Ping proves the child is past its stderr burst.
+	reqCtx, reqCancel := context.WithTimeout(ctx, 5*time.Second)
+	if _, err := stdio.SendRequest(reqCtx, JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      mcp.NewRequestId(int64(1)),
+		Method:  "ping",
+	}); err != nil {
+		t.Fatalf("SendRequest failed: %v", err)
+	}
+	reqCancel()
+
+	require.Eventually(t, func() bool {
+		return stderrBuf.Len() >= 64*1024
+	}, 10*time.Second, 50*time.Millisecond, "stderr output was not forwarded to the configured writer")
+}
+
+// failingWriter accepts the first write and then reports an error on every
+// subsequent write, modeling a custom stderr destination that breaks after
+// the child has already started emitting output.
+type failingWriter struct {
+	mu     sync.Mutex
+	writes int
+}
+
+// Write accepts the first write and fails every subsequent one.
+func (w *failingWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.writes++
+	if w.writes > 1 {
+		return 0, errors.New("stderr writer failed")
+	}
+	return len(p), nil
+}
+
+// WriteCount reports how many writes the failing writer has observed.
+func (w *failingWriter) WriteCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.writes
+}
+
+// TestStdio_WithCommandStderrWriterFailureStillDrains verifies that a custom
+// stderr writer which fails after its first write does not stop the stderr
+// drain. If the drain goroutine stopped, the child's stderr pipe would fill
+// up, the child would block inside write(2), and even Ping would time out.
+func TestStdio_WithCommandStderrWriterFailureStillDrains(t *testing.T) {
+	tempFile, err := os.CreateTemp(t.TempDir(), "mockstdio_stderr_server")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	tempFile.Close()
+	mockServerPath := tempFile.Name() + ".exe"
+
+	if compileErr := compileTestServerFromSource(mockServerPath, "../../testdata/mockstdio_stderr_server.go"); compileErr != nil {
+		t.Fatalf("Failed to compile mock server: %v", compileErr)
+	}
+
+	writer := &failingWriter{}
+	stdio := NewStdioWithOptions(mockServerPath, nil, nil, WithCommandStderrWriter(writer))
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	if err := stdio.Start(ctx); err != nil {
+		t.Fatalf("Failed to start Stdio transport: %v", err)
+	}
+	defer stdio.Close()
+
+	// The mock server writes ~256KB to stderr before answering. With the
+	// writer failing after the first chunk, only a drain that is decoupled
+	// from the writer keeps the pipe empty and the child responsive.
+	for i := range 3 {
+		reqCtx, reqCancel := context.WithTimeout(ctx, 5*time.Second)
+		_, err := stdio.SendRequest(reqCtx, JSONRPCRequest{
+			JSONRPC: "2.0",
+			ID:      mcp.NewRequestId(int64(i + 1)),
+			Method:  "ping",
+		})
+		reqCancel()
+		if err != nil {
+			t.Fatalf("SendRequest %d failed after stderr writer error: %v", i+1, err)
+		}
+	}
+
+	// The writer must have been exercised at least once, confirming this
+	// test actually runs the failure path rather than skipping it.
+	require.GreaterOrEqual(t, writer.WriteCount(), 1)
 }

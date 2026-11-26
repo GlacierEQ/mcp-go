@@ -9,12 +9,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -25,6 +28,29 @@ type mockReaderWithError struct {
 	err      error
 	position int
 	closed   bool
+}
+
+type blockingDoneContext struct {
+	context.Context
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+// RoundTrip delegates to the test function while satisfying http.RoundTripper.
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+// Done pauses context cancellation setup so tests can exercise the lifecycle boundary.
+func (c *blockingDoneContext) Done() <-chan struct{} {
+	c.once.Do(func() {
+		close(c.entered)
+		<-c.release
+	})
+	return c.Context.Done()
 }
 
 func (m *mockReaderWithError) Read(p []byte) (n int, err error) {
@@ -162,6 +188,53 @@ func startMockSSEEchoServer() (string, func()) {
 	testServer := httptest.NewServer(mux)
 
 	return testServer.URL, testServer.Close
+}
+
+func TestAppendSSEData(t *testing.T) {
+	tests := []struct {
+		name  string
+		lines []string // successive "data:" field values for one event
+		want  string
+	}{
+		{
+			name:  "single line drops one leading space",
+			lines: []string{` {"jsonrpc":"2.0"}`},
+			want:  `{"jsonrpc":"2.0"}`,
+		},
+		{
+			name:  "multiple lines joined with newline",
+			lines: []string{` {"jsonrpc":"2.0",`, ` "id":1,`, ` "result":{"ok":true}}`},
+			want:  "{\"jsonrpc\":\"2.0\",\n\"id\":1,\n\"result\":{\"ok\":true}}",
+		},
+		{
+			name:  "only one leading space removed, other whitespace preserved",
+			lines: []string{`  two leading`, "trailing  "},
+			want:  " two leading\ntrailing  ",
+		},
+		{
+			name:  "no leading space is preserved as-is",
+			lines: []string{`{"a":1}`},
+			want:  `{"a":1}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := ""
+			for _, line := range tt.lines {
+				data = appendSSEData(data, line)
+			}
+			require.Equal(t, tt.want, data)
+		})
+	}
+
+	// The reassembled multi-line JSON-RPC payload must still be valid JSON.
+	data := ""
+	for _, line := range []string{` {"jsonrpc":"2.0",`, ` "id":1,`, ` "result":{"ok":true}}`} {
+		data = appendSSEData(data, line)
+	}
+	var msg map[string]any
+	require.NoError(t, json.Unmarshal([]byte(data), &msg))
 }
 
 func TestSSE(t *testing.T) {
@@ -563,8 +636,7 @@ func TestSSE(t *testing.T) {
 		// that the readSSE method returns without calling any handler
 
 		// Directly test the readSSE method with our mock reader
-		go trans.readSSE(mockReader)
-
+		go trans.readSSE(mockReader, make(chan struct{}), &sync.Once{})
 		// Wait for readSSE to complete
 		time.Sleep(100 * time.Millisecond)
 
@@ -605,8 +677,7 @@ func TestSSE(t *testing.T) {
 		})
 
 		// Directly test the readSSE method with our mock reader that simulates ERROR
-		go trans.readSSE(mockReader)
-
+		go trans.readSSE(mockReader, make(chan struct{}), &sync.Once{})
 		// Wait for connection lost handler to be called
 		timeout := time.After(1 * time.Second)
 		ticker := time.NewTicker(10 * time.Millisecond)
@@ -631,6 +702,147 @@ func TestSSE(t *testing.T) {
 			}
 		}
 	})
+
+	// Close() cancels the stream context, so the read errors out just like a
+	// dropped connection would. The handler must fire for a genuine drop but
+	// stay silent when the closure was intentional, otherwise the caller
+	// reconnects a transport it deliberately shut down.
+	closeCases := []struct {
+		name         string
+		closedBefore bool
+		wantNotify   bool
+	}{
+		{name: "GenuineDropNotifies", closedBefore: false, wantNotify: true},
+		{name: "IntentionalCloseDoesNotNotify", closedBefore: true, wantNotify: false},
+	}
+
+	for _, tc := range closeCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var connectionLostCalled bool
+			var mu sync.Mutex
+
+			mockReader := &mockReaderWithError{
+				data: []byte("event: endpoint\ndata: /message\n\n"),
+				err:  context.Canceled,
+			}
+
+			url, closeF := startMockSSEEchoServer()
+			defer closeF()
+
+			trans, err := NewSSE(url)
+			require.NoError(t, err)
+
+			trans.SetConnectionLostHandler(func(err error) {
+				mu.Lock()
+				defer mu.Unlock()
+				connectionLostCalled = true
+			})
+
+			trans.closed.Store(tc.closedBefore)
+
+			done := make(chan struct{})
+			go func() {
+				trans.readSSE(mockReader, make(chan struct{}), &sync.Once{})
+				close(done)
+			}()
+
+			select {
+			case <-done:
+			case <-time.After(1 * time.Second):
+				t.Fatal("readSSE did not return in time")
+			}
+
+			// Let any erroneously-scheduled handler run before asserting.
+			time.Sleep(50 * time.Millisecond)
+
+			mu.Lock()
+			called := connectionLostCalled
+			mu.Unlock()
+			assert.Equal(t, tc.wantNotify, called)
+		})
+	}
+}
+
+func TestSSEStartAfterClose(t *testing.T) {
+	tests := []struct {
+		name             string
+		startBeforeClose bool
+		wantRequests     int32
+	}{
+		{name: "close before first start", wantRequests: 0},
+		{name: "close after successful start", startBeforeClose: true, wantRequests: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var requestCount atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requestCount.Add(1)
+				w.Header().Set("Content-Type", "text/event-stream")
+				flusher, ok := w.(http.Flusher)
+				if !ok {
+					http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+					return
+				}
+				_, _ = fmt.Fprint(w, "event: endpoint\ndata: /message\n\n")
+				flusher.Flush()
+				<-r.Context().Done()
+			}))
+			defer server.Close()
+
+			transport, err := NewSSE(server.URL)
+			require.NoError(t, err)
+			if tt.startBeforeClose {
+				require.NoError(t, transport.Start(t.Context()))
+			}
+			require.NoError(t, transport.Close())
+
+			err = transport.Start(t.Context())
+			require.ErrorIs(t, err, ErrTransportClosed)
+			require.Equal(t, tt.wantRequests, requestCount.Load())
+		})
+	}
+}
+
+func TestSSEConcurrentStartClosePublishesCancellation(t *testing.T) {
+	ctx := &blockingDoneContext{
+		Context: t.Context(),
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	httpClient := &http.Client{
+		Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			<-request.Context().Done()
+			return nil, request.Context().Err()
+		}),
+	}
+	transport, err := NewSSE("http://example.com/sse", WithHTTPClient(httpClient))
+	require.NoError(t, err)
+
+	startErr := make(chan error, 1)
+	go func() {
+		startErr <- transport.Start(ctx)
+	}()
+	<-ctx.entered
+
+	closeStarted := make(chan struct{})
+	closeErr := make(chan error, 1)
+	go func() {
+		close(closeStarted)
+		closeErr <- transport.Close()
+	}()
+	<-closeStarted
+
+	// Close must wait until Start publishes the stream canceler under lifecycleMu.
+	select {
+	case err := <-closeErr:
+		t.Fatalf("Close returned before Start published cancellation: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(ctx.release)
+	require.NoError(t, <-closeErr)
+	require.ErrorIs(t, <-startErr, context.Canceled)
 }
 
 func TestSSEErrors(t *testing.T) {
@@ -661,28 +873,30 @@ func TestSSEErrors(t *testing.T) {
 	})
 
 	t.Run("WithHTTPClient", func(t *testing.T) {
-		// Create a custom client with a very short timeout
-		customClient := &http.Client{Timeout: 1 * time.Nanosecond}
+		// Create a custom client with a short timeout
+		customClient := &http.Client{Timeout: 50 * time.Millisecond}
 
-		url, closeF := startMockSSEEchoServer()
-		defer closeF()
+		// The server never answers, so only the custom client's timeout can
+		// end Start before the context does.
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			<-r.Context().Done()
+		}))
+		defer server.Close()
 		// Initialize SSE transport with the custom HTTP client
-		trans, err := NewSSE(url, WithHTTPClient(customClient))
+		trans, err := NewSSE(server.URL, WithHTTPClient(customClient))
 		if err != nil {
 			t.Fatalf("Failed to create SSE with custom client: %v", err)
 		}
+		defer trans.Close()
 
-		// Starting should immediately error due to timeout
+		// Starting should error due to the client timeout
 		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 		defer cancel()
+		start := time.Now()
 		err = trans.Start(ctx)
-		if err == nil {
-			t.Error("Expected Start to fail with custom timeout, got nil")
-		}
-		if !errors.Is(err, context.DeadlineExceeded) {
-			t.Errorf("Expected error 'context deadline exceeded', got '%s'", err.Error())
-		}
-		trans.Close()
+		require.Error(t, err, "Expected Start to fail with custom timeout")
+		assert.ErrorIs(t, err, context.DeadlineExceeded)
+		assert.Less(t, time.Since(start), time.Second, "Start should end on the custom client's timeout, not the context deadline")
 	})
 
 	t.Run("RequestBeforeStart", func(t *testing.T) {
@@ -749,7 +963,7 @@ func TestSSEErrors(t *testing.T) {
 
 	t.Run("SSEStreamErrorLogging", func(t *testing.T) {
 		logChan := make(chan string, 10)
-		testLogger := &testLogger{logChan: logChan}
+		testLogger := newTestLogger(logChan)
 
 		sseHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -785,11 +999,9 @@ func TestSSEErrors(t *testing.T) {
 		// Wait for the error log message about unmarshaling
 		select {
 		case logMsg := <-logChan:
-			if !strings.Contains(logMsg, "Error unmarshaling message") {
-				t.Errorf("Expected error log about unmarshaling message, got: %s", logMsg)
-			}
+			require.Contains(t, logMsg, "Error unmarshaling message")
 		case <-time.After(3 * time.Second):
-			t.Fatal("Timeout waiting for error log message")
+			require.Fail(t, "Timeout waiting for error log message")
 		}
 	})
 }
@@ -1148,6 +1360,8 @@ func TestSSEHostOverride(t *testing.T) {
 	})
 }
 
+// TestSSE_SendRequest_Timeout verifies SendRequest fails with a timeout error
+// when the server accepts the request but never delivers an SSE response.
 func TestSSE_SendRequest_Timeout(t *testing.T) {
 	t.Run("TimeoutWhenServerNeverResponds", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1403,4 +1617,349 @@ func TestSSE_SendRequest_Timeout(t *testing.T) {
 		require.True(t, errors.Is(err, context.DeadlineExceeded),
 			"Expected context.DeadlineExceeded, got: %v", err)
 	})
+}
+
+// TestSSE_DuplicateEndpointEventDoesNotPanic is a regression test for the
+// "close of closed channel" panic triggered when a server (or proxy) sends a
+// second `endpoint` event. The transport must survive and keep processing
+// messages.
+func TestSSE_DuplicateEndpointEventDoesNotPanic(t *testing.T) {
+	var (
+		mu        sync.Mutex
+		sseWriter http.ResponseWriter
+		flush     func()
+	)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+		mu.Lock()
+		sseWriter = w
+		flush = flusher.Flush
+		mu.Unlock()
+
+		// Duplicate endpoint event: the SSE spec sends one, a re-broadcasting
+		// proxy may send more.
+		mu.Lock()
+		fmt.Fprintf(w, "event: endpoint\ndata: /message\n\n")
+		flusher.Flush()
+		fmt.Fprintf(w, "event: endpoint\ndata: /message\n\n")
+		flusher.Flush()
+		mu.Unlock()
+
+		<-r.Context().Done()
+	})
+	mux.HandleFunc("/message", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, fmt.Sprintf("Invalid JSON: %v", err), http.StatusBadRequest)
+			return
+		}
+		response := map[string]any{
+			"jsonrpc": "2.0",
+			"id":      request["id"],
+			"result":  map[string]any{},
+		}
+		data, _ := json.Marshal(response)
+		mu.Lock()
+		defer mu.Unlock()
+		if sseWriter != nil && flush != nil {
+			fmt.Fprintf(sseWriter, "event: message\ndata: %s\n\n", data)
+			flush()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+	})
+
+	testServer := httptest.NewServer(mux)
+	defer testServer.Close()
+
+	trans, err := NewSSE(testServer.URL)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	require.NoError(t, trans.Start(ctx))
+	defer trans.Close()
+
+	// After two endpoint events the transport must still route a response.
+	reqCtx, reqCancel := context.WithTimeout(ctx, 5*time.Second)
+	_, err = trans.SendRequest(reqCtx, JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      mcp.NewRequestId(int64(1)),
+		Method:  "ping",
+	})
+	reqCancel()
+	require.NoError(t, err, "SendRequest should succeed after a duplicate endpoint event")
+
+	// The negotiated endpoint must be readable without racing the SSE reader.
+	require.Equal(t, testServer.URL+"/message", trans.GetEndpoint().String())
+}
+
+// TestSSE_ServerRequestIsNotTakenAsResponse covers a request from the server,
+// such as a keep-alive ping, that carries the id of a request still waiting
+// for its response.
+func TestSSE_ServerRequestIsNotTakenAsResponse(t *testing.T) {
+	tests := []struct {
+		name string
+		id   mcp.RequestId
+	}{
+		{name: "numeric id", id: mcp.NewRequestId(int64(1))},
+		{name: "string id", id: mcp.NewRequestId("req-1")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var (
+				mu        sync.Mutex
+				sseWriter http.ResponseWriter
+				flush     func()
+			)
+
+			mux := http.NewServeMux()
+			mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				flusher, ok := w.(http.Flusher)
+				if !ok {
+					http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+					return
+				}
+				mu.Lock()
+				sseWriter = w
+				flush = flusher.Flush
+				fmt.Fprintf(w, "event: endpoint\ndata: /message\n\n")
+				flusher.Flush()
+				mu.Unlock()
+
+				<-r.Context().Done()
+			})
+			mux.HandleFunc("/message", func(w http.ResponseWriter, r *http.Request) {
+				var request map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					http.Error(w, fmt.Sprintf("Invalid JSON: %v", err), http.StatusBadRequest)
+					return
+				}
+				ping, _ := json.Marshal(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      request["id"],
+					"method":  "ping",
+				})
+				response, _ := json.Marshal(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      request["id"],
+					"result":  map[string]any{"answer": 42},
+				})
+				mu.Lock()
+				fmt.Fprintf(sseWriter, "event: message\ndata: %s\n\n", ping)
+				fmt.Fprintf(sseWriter, "event: message\ndata: %s\n\n", response)
+				flush()
+				mu.Unlock()
+				w.WriteHeader(http.StatusAccepted)
+			})
+
+			testServer := httptest.NewServer(mux)
+			defer testServer.Close()
+
+			trans, err := NewSSE(testServer.URL)
+			require.NoError(t, err)
+
+			ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+			defer cancel()
+
+			require.NoError(t, trans.Start(ctx))
+			defer trans.Close()
+
+			reqCtx, reqCancel := context.WithTimeout(ctx, 5*time.Second)
+			defer reqCancel()
+			response, err := trans.SendRequest(reqCtx, JSONRPCRequest{
+				JSONRPC: "2.0",
+				ID:      tt.id,
+				Method:  "tools/call",
+			})
+			require.NoError(t, err)
+			require.Nil(t, response.Error)
+			require.JSONEq(t, `{"answer":42}`, string(response.Result))
+		})
+	}
+}
+
+// TestSSE_InvalidEndpointEventsIgnored verifies that malformed or cross-origin
+// endpoint events are ignored: they must not panic, must not clobber the
+// endpoint, and must not prevent a later valid endpoint event from working.
+func TestSSE_InvalidEndpointEventsIgnored(t *testing.T) {
+	var (
+		mu        sync.Mutex
+		sseWriter http.ResponseWriter
+		flush     func()
+	)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+		mu.Lock()
+		sseWriter = w
+		flush = flusher.Flush
+		mu.Unlock()
+
+		// Invalid URL escape, then a cross-origin URL, then the valid one.
+		mu.Lock()
+		fmt.Fprintf(w, "event: endpoint\ndata: %%zz\n\n")
+		flusher.Flush()
+		fmt.Fprintf(w, "event: endpoint\ndata: http://evil.example.com/message\n\n")
+		flusher.Flush()
+		fmt.Fprintf(w, "event: endpoint\ndata: /message\n\n")
+		flusher.Flush()
+		mu.Unlock()
+
+		<-r.Context().Done()
+	})
+	mux.HandleFunc("/message", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, fmt.Sprintf("Invalid JSON: %v", err), http.StatusBadRequest)
+			return
+		}
+		response := map[string]any{
+			"jsonrpc": "2.0",
+			"id":      request["id"],
+			"result":  map[string]any{},
+		}
+		data, _ := json.Marshal(response)
+		mu.Lock()
+		defer mu.Unlock()
+		if sseWriter != nil && flush != nil {
+			fmt.Fprintf(sseWriter, "event: message\ndata: %s\n\n", data)
+			flush()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+	})
+
+	testServer := httptest.NewServer(mux)
+	defer testServer.Close()
+
+	trans, err := NewSSE(testServer.URL)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	require.NoError(t, trans.Start(ctx))
+	defer trans.Close()
+
+	// The invalid events must be ignored: only the valid endpoint is kept.
+	require.Equal(t, testServer.URL+"/message", trans.GetEndpoint().String())
+
+	reqCtx, reqCancel := context.WithTimeout(ctx, 5*time.Second)
+	_, err = trans.SendRequest(reqCtx, JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      mcp.NewRequestId(int64(1)),
+		Method:  "ping",
+	})
+	reqCancel()
+	require.NoError(t, err)
+}
+
+// TestSSE_SendNotification_EndpointNotReceived verifies the error path of the
+// endpoint read introduced by the endpoint locking.
+func TestSSE_SendNotification_EndpointNotReceived(t *testing.T) {
+	trans, err := NewSSE("http://127.0.0.1:1/")
+	require.NoError(t, err)
+
+	err = trans.SendNotification(t.Context(), mcp.JSONRPCNotification{
+		JSONRPC: "2.0",
+		Notification: mcp.Notification{
+			Method: "test/notification",
+		},
+	})
+	require.EqualError(t, err, "endpoint not received")
+}
+
+// TestSSE_CloseConcurrentWithMessageDoesNotPanic is a regression test for the
+// "send on closed channel" panic: Close() closes pending response channels
+// while handleSSEEvent is delivering a message. Delivery must hold the same
+// write lock as Close so the two can never interleave.
+//
+// The test uses an unbuffered channel to make the interleaving deterministic:
+// the sender blocks inside the delivery, the test then closes the transport,
+// and only afterwards drains the channel. Before the fix, Close() closed the
+// channel while the send was in flight and the blocked send panicked. With the
+// fix the send happens under the write lock, so Close() waits for it.
+func TestSSE_CloseConcurrentWithMessageDoesNotPanic(t *testing.T) {
+	trans, err := NewSSE("http://127.0.0.1:1/")
+	require.NoError(t, err)
+
+	// RequestId.String() disambiguates JSON numbers and strings ("int64:1" vs
+	// "string:1"), so the registered key and the wire message must agree.
+	idKey := mcp.NewRequestId(int64(1)).String()
+	// Unbuffered channel: the delivery blocks until somebody receives.
+	responseChan := make(chan *JSONRPCResponse)
+	trans.mu.Lock()
+	trans.responses[idKey] = responseChan
+	trans.mu.Unlock()
+
+	msg := `{"jsonrpc":"2.0","id":1,"result":{}}`
+
+	entering := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Sender: deliver the response. It blocks in the send until the test
+	// drains the channel below.
+	go func() {
+		defer wg.Done()
+		close(entering)
+		trans.handleSSEEvent("message", msg, make(chan struct{}), &sync.Once{})
+	}()
+
+	// Wait until the sender owns trans.mu: TryLock fails exactly while the
+	// write lock is held, i.e. while the sender is blocked sending into the
+	// unbuffered responseChan. Polling the lock state is deterministic and
+	// does not depend on scheduling delays like timing sleeps do.
+	<-entering
+	deadline := time.Now().Add(5 * time.Second)
+	for trans.mu.TryLock() {
+		trans.mu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("sender never acquired the write lock")
+		}
+		runtime.Gosched()
+	}
+
+	// Closer: runs while the send is in flight. Before the fix this closed
+	// responseChan under the sender and the blocked send panicked; with the
+	// fix it blocks on the write lock until the send completes.
+	go func() {
+		defer wg.Done()
+		_ = trans.Close()
+	}()
+
+	// Drain the channel so the in-flight send completes; with the fix the
+	// closer's Close() waits for this before closing (now empty) channels.
+	select {
+	case resp := <-responseChan:
+		require.NotNil(t, resp)
+	case <-time.After(5 * time.Second):
+		t.Fatal("response was not delivered")
+	}
+
+	wg.Wait()
 }

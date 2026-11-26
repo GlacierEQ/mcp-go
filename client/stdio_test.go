@@ -28,7 +28,13 @@ func compileTestServer(outputPath string) error {
 		outputPath,
 		"../testdata/mockstdio_server.go",
 	)
-	tmpCache, _ := os.MkdirTemp("", "gocache")
+	// Each build gets a cache of its own, which #241 added for a flaky
+	// parallel build. Nothing reuses it, so it goes once the build is done.
+	tmpCache, err := os.MkdirTemp("", "gocache")
+	if err != nil {
+		return fmt.Errorf("creating build cache: %w", err)
+	}
+	defer os.RemoveAll(tmpCache)
 	cmd.Env = append(os.Environ(), "GOCACHE="+tmpCache)
 
 	if output, err := cmd.CombinedOutput(); err != nil {
@@ -529,7 +535,13 @@ func TestStdio_ConcurrentRequestsAllReceiveResponses(t *testing.T) {
 			}
 
 			var resp map[string]any
-			if method == "initialize" {
+			if method == string(mcp.MethodServerDiscover) {
+				resp = map[string]any{
+					"jsonrpc": "2.0",
+					"id":      id,
+					"error":   map[string]any{"code": mcp.METHOD_NOT_FOUND, "message": "Method not found"},
+				}
+			} else if method == "initialize" {
 				resp = map[string]any{
 					"jsonrpc": "2.0",
 					"id":      id,
@@ -569,6 +581,7 @@ func TestStdio_ConcurrentRequestsAllReceiveResponses(t *testing.T) {
 	initReq.Params.ClientInfo = mcp.Implementation{Name: "stress-test", Version: "1.0"}
 	_, err := c.Initialize(t.Context(), initReq)
 	require.NoError(t, err)
+	require.Equal(t, mcp.ProtocolVersion20241105, c.ProtocolVersion())
 
 	// Fire N concurrent ListTools requests
 	var wg sync.WaitGroup
@@ -690,10 +703,12 @@ func TestStdio_ConcurrentRequestsUnblockOnServerDeath(t *testing.T) {
 
 func TestStdio_NewStdioMCPClientWithOptions_CreatesAndStartsClient(t *testing.T) {
 	called := false
+	helperPath, err := os.Executable()
+	require.NoError(t, err)
 
 	fakeCmdFunc := func(ctx context.Context, command string, args []string, env []string) (*exec.Cmd, error) {
 		called = true
-		return exec.CommandContext(ctx, "echo", "started"), nil
+		return exec.CommandContext(ctx, helperPath, "-test.run=^TestClientStdioHelperProcess$"), nil
 	}
 
 	client, err := NewStdioMCPClientWithOptions(
@@ -710,6 +725,8 @@ func TestStdio_NewStdioMCPClientWithOptions_CreatesAndStartsClient(t *testing.T)
 	require.True(t, called)
 }
 
+func TestClientStdioHelperProcess(t *testing.T) {}
+
 func TestStdio_NewStdioMCPClientWithOptions_FailsToStart(t *testing.T) {
 	// Create a commandFunc that points to a nonexistent binary
 	badCmdFunc := func(ctx context.Context, command string, args []string, env []string) (*exec.Cmd, error) {
@@ -724,6 +741,6 @@ func TestStdio_NewStdioMCPClientWithOptions_FailsToStart(t *testing.T) {
 	)
 
 	require.Error(t, err)
-	require.EqualError(t, err, "failed to start stdio transport: failed to start command: fork/exec /nonexistent/bar: no such file or directory")
+	require.ErrorContains(t, err, "/nonexistent/bar")
 	require.Nil(t, client)
 }

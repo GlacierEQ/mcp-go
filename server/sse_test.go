@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -18,6 +19,71 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
 )
+
+func TestSSERejectsDuplicateRequestIDBeforeInitializationHook(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+
+	hooks := &Hooks{}
+	hooks.AddOnRequestInitialization(func(ctx context.Context, _ any, message any) error {
+		var request struct {
+			Method string `json:"method"`
+		}
+		if err := json.Unmarshal(message.(json.RawMessage), &request); err != nil {
+			return err
+		}
+		if request.Method != string(mcp.MethodPing) {
+			return errors.New("request rejected by hook")
+		}
+		close(started)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-release:
+			return nil
+		}
+	})
+	ts := NewTestServer(NewMCPServer("test", "1", WithHooks(hooks)))
+	defer ts.Close()
+	get, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/sse", nil)
+	require.NoError(t, err)
+	stream, err := ts.Client().Do(get)
+	require.NoError(t, err)
+	defer stream.Body.Close()
+	reader := bufio.NewReader(stream.Body)
+	endpoint := readSSEEndpoint(t, reader)
+	post := func(body string) {
+		t.Helper()
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(body))
+		require.NoError(t, err)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := ts.Client().Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		require.Equal(t, http.StatusAccepted, resp.StatusCode)
+	}
+
+	post(`{"jsonrpc":"2.0","id":7,"method":"ping"}`)
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("original request did not reach the hook")
+	}
+	post(`{"jsonrpc":"2.0","id":7,"method":"tools/list"}`)
+	var duplicate mcp.JSONRPCError
+	readSSEData(t, reader, &duplicate)
+	require.Equal(t, mcp.INVALID_REQUEST, duplicate.Error.Code)
+	require.True(t, duplicate.ID.IsNil(), "duplicate error must not be delivered to the original call")
+
+	post(`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}`)
+	var original mcp.JSONRPCError
+	readSSEData(t, reader, &original)
+	require.Equal(t, mcp.NewRequestId(int64(7)), original.ID)
+	require.Equal(t, context.Canceled.Error(), original.Error.Message)
+}
 
 func TestSSEServer(t *testing.T) {
 	t.Run("Can instantiate", func(t *testing.T) {
@@ -1324,8 +1390,9 @@ func TestSSEServer(t *testing.T) {
 			t.Fatalf("Failed to read SSE response: %v", err)
 		}
 
-		if !strings.Contains(endpointEvent, "\"id\": null") {
-			t.Errorf("Expected id to be null")
+		// The client matches the error to its pending call by id.
+		if !strings.Contains(endpointEvent, `"id":1`) || !strings.Contains(endpointEvent, `"code":-32603`) {
+			t.Errorf("Expected an internal error for request 1, got: %s", endpointEvent)
 		}
 	})
 
@@ -1438,6 +1505,30 @@ func TestSSEServer(t *testing.T) {
 		case err := <-shutdownDone:
 			if ctx.Err() == context.DeadlineExceeded {
 				t.Fatalf("Shutdown deadlocked (timed out): %v", err)
+			}
+		case <-time.After(1 * time.Second):
+			t.Fatal("Shutdown did not return in time (likely deadlocked)")
+		}
+	})
+
+	t.Run("Shutdown() after Start() fails with a conflicting address should not deadlock", func(t *testing.T) {
+		mcpServer := NewMCPServer("test", "1.0.0")
+		sseServer := NewSSEServer(mcpServer, WithHTTPServer(&http.Server{Addr: "127.0.0.1:9999"}))
+
+		err := sseServer.Start("127.0.0.1:8888")
+		if err == nil || !strings.Contains(err.Error(), "conflicting listen address") {
+			t.Fatalf("Expected a conflicting listen address error, got %v", err)
+		}
+
+		shutdownDone := make(chan error, 1)
+		go func() {
+			shutdownDone <- sseServer.Shutdown(t.Context())
+		}()
+
+		select {
+		case err := <-shutdownDone:
+			if err != nil {
+				t.Fatalf("Shutdown returned an error: %v", err)
 			}
 		case <-time.After(1 * time.Second):
 			t.Fatal("Shutdown did not return in time (likely deadlocked)")

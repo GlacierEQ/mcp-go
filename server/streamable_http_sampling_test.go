@@ -7,8 +7,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 
 	"github.com/mark3labs/mcp-go/mcp"
 )
@@ -26,7 +29,7 @@ func TestStreamableHTTPServer_SamplingBasic(t *testing.T) {
 
 	// Test session creation and interface implementation
 	sessionID := "test-session"
-	session := newStreamableHttpSession(sessionID, httpServer.sessionTools, httpServer.sessionResources, httpServer.sessionResourceTemplates, httpServer.sessionLogLevels)
+	session := newStreamableHttpSession(sessionID, httpServer.sessionTools, httpServer.sessionResources, httpServer.sessionResourceTemplates, httpServer.sessionLogLevels, &httpServer.requestIDCounter)
 
 	// Verify it implements SessionWithSampling
 	_, ok := any(session).(SessionWithSampling)
@@ -139,7 +142,7 @@ func TestStreamableHTTPServer_SamplingInterface(t *testing.T) {
 
 	// Create a session
 	sessionID := "test-session"
-	session := newStreamableHttpSession(sessionID, httpServer.sessionTools, httpServer.sessionResources, httpServer.sessionResourceTemplates, httpServer.sessionLogLevels)
+	session := newStreamableHttpSession(sessionID, httpServer.sessionTools, httpServer.sessionResources, httpServer.sessionResourceTemplates, httpServer.sessionLogLevels, &httpServer.requestIDCounter)
 
 	// Verify it implements SessionWithSampling
 	_, ok := any(session).(SessionWithSampling)
@@ -178,7 +181,7 @@ func TestStreamableHTTPServer_SamplingInterface(t *testing.T) {
 // TestStreamableHTTPServer_SamplingQueueFull tests queue overflow scenarios
 func TestStreamableHTTPServer_SamplingQueueFull(t *testing.T) {
 	sessionID := "test-session"
-	session := newStreamableHttpSession(sessionID, nil, nil, nil, nil)
+	session := newStreamableHttpSession(sessionID, nil, nil, nil, nil, new(atomic.Int64))
 
 	// Fill the sampling request queue
 	for i := 0; i < cap(session.samplingRequestChan); i++ {
@@ -213,4 +216,38 @@ func TestStreamableHTTPServer_SamplingQueueFull(t *testing.T) {
 	if !strings.Contains(err.Error(), "queue is full") {
 		t.Errorf("Expected queue full error, got: %v", err)
 	}
+}
+
+func TestStreamableHTTPServer_SamplingArrayContent(t *testing.T) {
+	session := newStreamableHttpSession("test-session", nil, nil, nil, nil, new(atomic.Int64))
+
+	go func() {
+		item := <-session.samplingRequestChan
+		item.response <- samplingResponseItem{
+			requestID: item.requestID,
+			result: json.RawMessage(`{
+				"role": "assistant",
+				"content": [
+					{"type": "tool_use", "id": "call_abc123", "name": "get_weather", "input": {"city": "Paris"}},
+					{"type": "tool_use", "id": "call_def456", "name": "get_weather", "input": {"city": "London"}}
+				],
+				"model": "test-model",
+				"stopReason": "toolUse"
+			}`),
+		}
+	}()
+
+	result, err := session.RequestSampling(t.Context(), mcp.CreateMessageRequest{
+		CreateMessageParams: mcp.CreateMessageParams{
+			Messages: []mcp.SamplingMessage{
+				{Role: mcp.RoleUser, Content: mcp.NewTextContent("What's the weather like in Paris and London?")},
+			},
+			MaxTokens: 1000,
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, []mcp.Content{
+		mcp.NewToolUseContent("call_abc123", "get_weather", map[string]any{"city": "Paris"}),
+		mcp.NewToolUseContent("call_def456", "get_weather", map[string]any{"city": "London"}),
+	}, result.Content)
 }

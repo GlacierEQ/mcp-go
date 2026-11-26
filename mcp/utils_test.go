@@ -449,6 +449,28 @@ func TestParseContent(t *testing.T) {
 			expectError: false,
 		},
 		{
+			name: "resource link with _meta",
+			contentMap: map[string]any{
+				"type": "resource_link",
+				"uri":  "file:///test.txt",
+				"name": "test.txt",
+				"_meta": map[string]any{
+					"source_url": "https://example.com",
+				},
+			},
+			expected: ResourceLink{
+				Type: ContentTypeLink,
+				URI:  "file:///test.txt",
+				Name: "test.txt",
+				Meta: &Meta{
+					AdditionalFields: map[string]any{
+						"source_url": "https://example.com",
+					},
+				},
+			},
+			expectError: false,
+		},
+		{
 			name: "text content with _meta containing progressToken",
 			contentMap: map[string]any{
 				"type": "text",
@@ -654,6 +676,7 @@ func TestParseContent(t *testing.T) {
 					assert.Equal(t, exp.MIMEType, act.MIMEType)
 					assert.Equal(t, exp.Size, act.Size)
 					assert.Equal(t, exp.Annotations, act.Annotations)
+					assert.Equal(t, exp.Meta, act.Meta)
 				case EmbeddedResource:
 					act, ok := result.(EmbeddedResource)
 					assert.True(t, ok)
@@ -686,6 +709,59 @@ func TestParseContent(t *testing.T) {
 					assert.Equal(t, tt.expected, result)
 				}
 			}
+		})
+	}
+}
+
+func TestParseSamplingContent(t *testing.T) {
+	tests := []struct {
+		name        string
+		content     any
+		expected    any
+		expectError string
+	}{
+		{
+			name:     "single block",
+			content:  map[string]any{"type": "text", "text": "Hello"},
+			expected: NewTextContent("Hello"),
+		},
+		{
+			name: "array of blocks",
+			content: []any{
+				map[string]any{"type": "tool_use", "id": "call_1", "name": "get_weather", "input": map[string]any{"city": "Paris"}},
+				map[string]any{"type": "tool_use", "id": "call_2", "name": "get_weather", "input": map[string]any{"city": "London"}},
+			},
+			expected: []Content{
+				NewToolUseContent("call_1", "get_weather", map[string]any{"city": "Paris"}),
+				NewToolUseContent("call_2", "get_weather", map[string]any{"city": "London"}),
+			},
+		},
+		{
+			name:     "typed content",
+			content:  NewTextContent("Hello"),
+			expected: NewTextContent("Hello"),
+		},
+		{
+			name:        "array entry that is not an object",
+			content:     []any{"Hello"},
+			expectError: "content[0]: expected object, got string",
+		},
+		{
+			name:        "array entry with an unknown type",
+			content:     []any{map[string]any{"type": "video"}},
+			expectError: "content[0]: unsupported content type: video",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := ParseSamplingContent(tt.content)
+			if tt.expectError != "" {
+				require.EqualError(t, err, tt.expectError)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.expected, result)
 		})
 	}
 }

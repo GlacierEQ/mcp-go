@@ -147,6 +147,33 @@ func TestResourceLinkTitleAndSize(t *testing.T) {
 	}
 }
 
+// TestResourceLinkMeta mirrors the _meta round-trip that Resource and the other
+// content blocks already have: per the MCP spec a ResourceLink carries the same
+// metadata as a Resource, so its _meta must survive JSON round-trips and be
+// omitted from the wire when unset.
+func TestResourceLinkMeta(t *testing.T) {
+	t.Run("meta omitted when unset", func(t *testing.T) {
+		rl := NewResourceLink("file:///x.txt", "x.txt", "", "")
+		data, err := json.Marshal(rl)
+		require.NoError(t, err)
+		assert.NotContains(t, string(data), `"_meta"`)
+	})
+
+	t.Run("meta round-trips when set", func(t *testing.T) {
+		rl := NewResourceLink("file:///x.txt", "x.txt", "", "")
+		rl.Meta = &Meta{AdditionalFields: map[string]any{"source_url": "https://example.com"}}
+
+		data, err := json.Marshal(rl)
+		require.NoError(t, err)
+		assert.Contains(t, string(data), `"_meta"`)
+
+		var rt ResourceLink
+		require.NoError(t, json.Unmarshal(data, &rt))
+		require.NotNil(t, rt.Meta)
+		assert.Equal(t, "https://example.com", rt.Meta.AdditionalFields["source_url"])
+	})
+}
+
 func TestCallToolResultWithResourceLink(t *testing.T) {
 	result := &CallToolResult{
 		Content: []Content{
@@ -505,6 +532,48 @@ func TestCompleteParamsUnmarshalJSON(t *testing.T) {
 				assert.NoError(t, err)
 				assert.Equal(t, tc.expected, got)
 			}
+		})
+	}
+}
+
+func TestCompleteParamsMarshalJSON(t *testing.T) {
+	tests := []struct {
+		name     string
+		params   CompleteParams
+		expected string
+	}{
+		{
+			name: "No context arguments",
+			params: CompleteParams{
+				Ref:      PromptReference{Type: "ref/prompt", Name: "test-prompt"},
+				Argument: CompleteArgument{Name: "test-arg", Value: "test-value"},
+			},
+			expected: `{
+				"ref": {"type": "ref/prompt", "name": "test-prompt"},
+				"argument": {"name": "test-arg", "value": "test-value"},
+				"context": {}
+			}`,
+		},
+		{
+			name: "With context arguments",
+			params: CompleteParams{
+				Ref:      PromptReference{Type: "ref/prompt", Name: "test-prompt"},
+				Argument: CompleteArgument{Name: "test-arg", Value: "test-value"},
+				Context:  CompleteContext{Arguments: map[string]string{"other-arg": "other-value"}},
+			},
+			expected: `{
+				"ref": {"type": "ref/prompt", "name": "test-prompt"},
+				"argument": {"name": "test-arg", "value": "test-value"},
+				"context": {"arguments": {"other-arg": "other-value"}}
+			}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			data, err := json.Marshal(tc.params)
+			require.NoError(t, err)
+			assert.JSONEq(t, tc.expected, string(data))
 		})
 	}
 }

@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -146,8 +148,8 @@ func TestStreamableHTTP_POST_SendAndReceive(t *testing.T) {
 		if err := json.Unmarshal(bodyBytes, &responseMessage); err != nil {
 			t.Fatalf("Failed to unmarshal response: %v", err)
 		}
-		if responseMessage.Result["protocolVersion"] != mcp.LATEST_PROTOCOL_VERSION {
-			t.Errorf("Expected protocol version %s, got %s", mcp.LATEST_PROTOCOL_VERSION, responseMessage.Result["protocolVersion"])
+		if responseMessage.Result["protocolVersion"] != mcp.LATEST_LEGACY_PROTOCOL_VERSION {
+			t.Errorf("Expected protocol version %s, got %s", mcp.LATEST_LEGACY_PROTOCOL_VERSION, responseMessage.Result["protocolVersion"])
 		}
 
 		// get session id from header
@@ -337,8 +339,8 @@ func TestStreamableHTTP_POST_SendAndReceive_stateless(t *testing.T) {
 		if err := json.Unmarshal(bodyBytes, &responseMessage); err != nil {
 			t.Fatalf("Failed to unmarshal response: %v", err)
 		}
-		if responseMessage.Result["protocolVersion"] != mcp.LATEST_PROTOCOL_VERSION {
-			t.Errorf("Expected protocol version %s, got %s", mcp.LATEST_PROTOCOL_VERSION, responseMessage.Result["protocolVersion"])
+		if responseMessage.Result["protocolVersion"] != mcp.LATEST_LEGACY_PROTOCOL_VERSION {
+			t.Errorf("Expected protocol version %s, got %s", mcp.LATEST_LEGACY_PROTOCOL_VERSION, responseMessage.Result["protocolVersion"])
 		}
 
 		// no session id from header
@@ -546,6 +548,117 @@ func TestStreamableHTTP_GET(t *testing.T) {
 	}
 }
 
+func TestStreamableHTTP_GET_StatelessStreamsAreIndependent(t *testing.T) {
+	tests := []struct {
+		name string
+		opts []StreamableHTTPOption
+	}{
+		{name: "without event store"},
+		{name: "with event store", opts: []StreamableHTTPOption{WithEventStore(NewInMemoryEventStore())}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hooks := &Hooks{}
+			registered := make(chan string, 2)
+			hooks.AddOnRegisterSession(func(_ context.Context, client ClientSession) {
+				session := client.(*streamableHttpSession)
+				session.SetSessionTools(map[string]ServerTool{
+					"ephemeral": {Tool: mcp.Tool{Name: "ephemeral"}},
+				})
+				registered <- session.SessionID()
+			})
+			mcpServer := NewMCPServer("test", "1.0", WithHooks(hooks))
+			handler := NewStreamableHTTPServer(mcpServer, append(tt.opts, WithStateLess(true))...)
+			firstDone := make(chan struct{})
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Query().Get("stream") == "first" {
+					defer close(firstDone)
+				}
+				handler.ServeHTTP(w, r)
+			}))
+			defer ts.Close()
+
+			openStream := func(ctx context.Context, name string) <-chan string {
+				t.Helper()
+				req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/mcp?stream="+name, nil)
+				require.NoError(t, err)
+				req.Header.Set("Accept", "text/event-stream")
+				resp, err := ts.Client().Do(req)
+				require.NoError(t, err)
+				t.Cleanup(func() { resp.Body.Close() })
+				require.Equal(t, http.StatusOK, resp.StatusCode)
+				require.Equal(t, "text/event-stream", resp.Header.Get("Content-Type"))
+				assert.Empty(t, resp.Header.Get(HeaderKeySessionID))
+
+				events := make(chan string, 2)
+				go func() {
+					defer close(events)
+					scanner := bufio.NewScanner(resp.Body)
+					for scanner.Scan() {
+						if data, ok := strings.CutPrefix(scanner.Text(), "data: "); ok {
+							select {
+							case events <- data:
+							case <-ctx.Done():
+								return
+							}
+						}
+					}
+				}()
+				return events
+			}
+			assertNotification := func(events <-chan string, stream, value string) {
+				t.Helper()
+				select {
+				case data, ok := <-events:
+					if assert.Truef(t, ok, "%s stream closed before notification %q", stream, value) {
+						assert.Contains(t, data, `"method":"notifications/message"`)
+						assert.Contains(t, data, `"value":"`+value+`"`)
+					}
+				case <-time.After(time.Second):
+					t.Errorf("%s stream did not receive notification %q", stream, value)
+				}
+			}
+
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			firstCtx, cancelFirst := context.WithCancel(ctx)
+			defer cancelFirst()
+			getRegisteredID := func() string {
+				t.Helper()
+				select {
+				case id := <-registered:
+					return id
+				case <-ctx.Done():
+					t.Fatal("timed out waiting for GET session registration")
+					return ""
+				}
+			}
+			first := openStream(firstCtx, "first")
+			firstID := getRegisteredID()
+			second := openStream(ctx, "second")
+			secondID := getRegisteredID()
+			require.NotEqual(t, firstID, secondID)
+			require.Len(t, handler.sessionTools.get(firstID), 1)
+			require.Len(t, handler.sessionTools.get(secondID), 1)
+
+			mcpServer.SendNotificationToAllClients("notifications/message", map[string]any{"value": "both connected"})
+			assertNotification(first, "first", "both connected")
+			assertNotification(second, "second", "both connected")
+
+			cancelFirst()
+			select {
+			case <-firstDone:
+			case <-ctx.Done():
+				t.Fatal("first GET handler did not exit after cancellation")
+			}
+			require.Empty(t, handler.sessionTools.get(firstID), "disconnected stream leaked its session tools")
+			require.Len(t, handler.sessionTools.get(secondID), 1, "active stream lost its session tools")
+			mcpServer.SendNotificationToAllClients("notifications/message", map[string]any{"value": "after disconnect"})
+			assertNotification(second, "second", "after disconnect")
+		})
+	}
+}
+
 func TestStreamableHTTP_HttpHandler(t *testing.T) {
 	t.Run("Works with custom mux", func(t *testing.T) {
 		mcpServer := NewMCPServer("test", "1.0.0")
@@ -583,8 +696,8 @@ func TestStreamableHTTP_HttpHandler(t *testing.T) {
 		if err := json.Unmarshal(bodyBytes, &responseMessage); err != nil {
 			t.Fatalf("Failed to unmarshal response: %v", err)
 		}
-		if responseMessage.Result["protocolVersion"] != mcp.LATEST_PROTOCOL_VERSION {
-			t.Errorf("Expected protocol version %s, got %s", mcp.LATEST_PROTOCOL_VERSION, responseMessage.Result["protocolVersion"])
+		if responseMessage.Result["protocolVersion"] != mcp.LATEST_LEGACY_PROTOCOL_VERSION {
+			t.Errorf("Expected protocol version %s, got %s", mcp.LATEST_LEGACY_PROTOCOL_VERSION, responseMessage.Result["protocolVersion"])
 		}
 	})
 }
@@ -1071,6 +1184,31 @@ func TestStreamableHTTPServer_WithOptions(t *testing.T) {
 		}
 	})
 
+	t.Run("Shutdown after Start with conflicting address does not deadlock", func(t *testing.T) {
+		mcpServer := NewMCPServer("test", "1.0.0")
+		customServer := &http.Server{Addr: ":9999"}
+		httpServer := NewStreamableHTTPServer(mcpServer, WithStreamableHTTPServer(customServer))
+
+		err := httpServer.Start(":8888")
+		if err == nil || !strings.Contains(err.Error(), "conflicting listen address") {
+			t.Fatalf("Expected a conflicting listen address error, got %v", err)
+		}
+
+		shutdownDone := make(chan error, 1)
+		go func() {
+			shutdownDone <- httpServer.Shutdown(t.Context())
+		}()
+
+		select {
+		case err := <-shutdownDone:
+			if err != nil {
+				t.Fatalf("Shutdown returned an error: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("Shutdown did not return after Start failed")
+		}
+	})
+
 	t.Run("Options consistency test", func(t *testing.T) {
 		mcpServer := NewMCPServer("test", "1.0.0")
 		endpointPath := "/test-mcp"
@@ -1328,8 +1466,8 @@ func TestStreamableHTTPServer_WithDisableStreaming(t *testing.T) {
 		if err := json.Unmarshal(bodyBytes, &responseMessage); err != nil {
 			t.Fatalf("Failed to unmarshal response: %v", err)
 		}
-		if responseMessage.Result["protocolVersion"] != mcp.LATEST_PROTOCOL_VERSION {
-			t.Errorf("Expected protocol version %s, got %s", mcp.LATEST_PROTOCOL_VERSION, responseMessage.Result["protocolVersion"])
+		if responseMessage.Result["protocolVersion"] != mcp.LATEST_LEGACY_PROTOCOL_VERSION {
+			t.Errorf("Expected protocol version %s, got %s", mcp.LATEST_LEGACY_PROTOCOL_VERSION, responseMessage.Result["protocolVersion"])
 		}
 	})
 
@@ -1585,6 +1723,94 @@ func TestStreamableHTTP_SessionValidation(t *testing.T) {
 			body, _ := io.ReadAll(resp.Body)
 			t.Errorf("Expected status 404, got %d. Body: %s", resp.StatusCode, string(body))
 		}
+	})
+}
+
+func TestStreamableHTTP_ProtocolVersionHeader(t *testing.T) {
+	mcpServer := NewMCPServer("test-server", "1.0.0", WithToolCapabilities(true))
+	server := NewTestStreamableHTTPServer(mcpServer, WithStateful(true))
+	defer server.Close()
+
+	sessionID := establishLegacySession(t, server.URL)
+
+	send := func(t *testing.T, method string, body any, protocolVersion string) (int, string) {
+		t.Helper()
+		var reader io.Reader
+		if body != nil {
+			jsonBody, err := json.Marshal(body)
+			require.NoError(t, err)
+			reader = bytes.NewReader(jsonBody)
+		}
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, method, server.URL, reader)
+		require.NoError(t, err)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(HeaderKeySessionID, sessionID)
+		if protocolVersion != "" {
+			req.Header.Set(mcp.HeaderProtocolVersion, protocolVersion)
+		}
+		resp, err := server.Client().Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		payload, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		return resp.StatusCode, string(payload)
+	}
+
+	listTools := map[string]any{"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
+
+	t.Run("unsupported version is rejected", func(t *testing.T) {
+		for _, method := range []string{http.MethodPost, http.MethodGet, http.MethodDelete} {
+			t.Run(method, func(t *testing.T) {
+				var body any
+				if method == http.MethodPost {
+					body = listTools
+				}
+				status, payload := send(t, method, body, "2025-01-01")
+				assert.Equal(t, http.StatusBadRequest, status)
+				assert.Contains(t, payload, "Unsupported protocol version: 2025-01-01")
+			})
+		}
+	})
+
+	t.Run("unsupported version is rejected on responses", func(t *testing.T) {
+		responses := map[string]map[string]any{
+			"ping":  {"jsonrpc": "2.0", "id": 1, "result": map[string]any{}},
+			"empty": {"jsonrpc": "2.0", "id": 1},
+		}
+		for name, body := range responses {
+			t.Run(name, func(t *testing.T) {
+				status, payload := send(t, http.MethodPost, body, "2025-01-01")
+				assert.Equal(t, http.StatusBadRequest, status)
+				assert.Contains(t, payload, "Unsupported protocol version: 2025-01-01")
+			})
+		}
+	})
+
+	t.Run("supported version is accepted", func(t *testing.T) {
+		status, payload := send(t, http.MethodPost, listTools, mcp.LATEST_LEGACY_PROTOCOL_VERSION)
+		assert.Equal(t, http.StatusOK, status, payload)
+	})
+
+	t.Run("missing header is accepted", func(t *testing.T) {
+		status, payload := send(t, http.MethodPost, listTools, "")
+		assert.Equal(t, http.StatusOK, status, payload)
+	})
+
+	t.Run("initialize is not checked", func(t *testing.T) {
+		initialize := map[string]any{
+			"jsonrpc": "2.0",
+			"id":      3,
+			"method":  mcp.MethodInitialize,
+			"params": map[string]any{
+				"protocolVersion": mcp.LATEST_LEGACY_PROTOCOL_VERSION,
+				"clientInfo":      map[string]any{"name": "test-client", "version": "1.0.0"},
+				"capabilities":    map[string]any{},
+			},
+		}
+		status, payload := send(t, http.MethodPost, initialize, "2025-01-01")
+		assert.Equal(t, http.StatusOK, status, payload)
 	})
 }
 
@@ -2523,6 +2749,20 @@ func TestStreamableHTTP_Delete(t *testing.T) {
 	assert.Equal(t, sessionID, hookSession.SessionID())
 }
 
+func TestStreamableHTTP_HeadReturns200(t *testing.T) {
+	mcpServer := NewMCPServer("test-mcp-server", "1.0")
+	sseServer := NewStreamableHTTPServer(mcpServer)
+	testServer := httptest.NewServer(sseServer)
+	defer testServer.Close()
+
+	req, _ := http.NewRequest(http.MethodHead, testServer.URL, nil)
+	resp, err := testServer.Client().Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
 func TestStreamableHTTP_DrainNotifications(t *testing.T) {
 	t.Run("drain pending notifications after response is computed", func(t *testing.T) {
 		mcpServer := NewMCPServer("test-mcp-server", "1.0")
@@ -2743,6 +2983,52 @@ func TestStreamableHTTP_SessionIdleTTLSweeper(t *testing.T) {
 		assert.Empty(t, tools, "sessionTools should be cleaned")
 	})
 
+	t.Run("swept session ends its quiet GET stream", func(t *testing.T) {
+		mcpServer := NewMCPServer("test", "1.0")
+		httpServer := NewStreamableHTTPServer(mcpServer,
+			WithSessionIdleTTL(100*time.Millisecond),
+		)
+		defer func() { _ = httpServer.Shutdown(t.Context()) }()
+		ts := httptest.NewServer(httpServer)
+		defer ts.Close()
+
+		resp, err := postJSON(ts.URL, initRequest)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		sessionID := resp.Header.Get(HeaderKeySessionID)
+		require.NotEmpty(t, sessionID)
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL, nil)
+		require.NoError(t, err)
+		req.Header.Set(HeaderKeySessionID, sessionID)
+		getResp, err := ts.Client().Do(req)
+		require.NoError(t, err)
+		defer getResp.Body.Close()
+		require.Equal(t, http.StatusOK, getResp.StatusCode)
+
+		ended := make(chan struct{})
+		go func() {
+			_, _ = io.Copy(io.Discard, getResp.Body)
+			close(ended)
+		}()
+
+		require.Eventually(t, func() bool {
+			_, exists := httpServer.sessionLastActive.Load(sessionID)
+			return !exists
+		}, 3*time.Second, 50*time.Millisecond, "session should be swept after idle TTL")
+
+		// The session no longer receives notifications, so its GET stream
+		// must end to let the client reconnect.
+		select {
+		case <-ended:
+		case <-time.After(2 * time.Second):
+			t.Fatal("GET stream stayed open after its session was swept")
+		}
+	})
+
 	t.Run("active sessions are not swept", func(t *testing.T) {
 		mcpServer := NewMCPServer("test", "1.0")
 		httpServer := NewStreamableHTTPServer(mcpServer,
@@ -2878,53 +3164,163 @@ func TestStreamableHTTPNotificationRace(t *testing.T) {
 	}
 }
 
-// TestStreamableHTTP_SessionRequestIDs_CleanedOnGetClose verifies that the
-// sessionRequestIDs entry is removed when a GET connection closes, preventing
-// unbounded growth in stateless/heartbeat scenarios.
-func TestStreamableHTTP_SessionRequestIDs_CleanedOnGetClose(t *testing.T) {
-	tests := []struct {
-		name string
-	}{
-		{name: "cleanup on GET close"},
-	}
+// TestStreamableHTTP_ServerRequestIDsDoNotCollide verifies that heartbeat
+// pings and server-to-client requests draw from the same counter, so two
+// requests on one session never share a JSON-RPC ID.
+func TestStreamableHTTP_ServerRequestIDsDoNotCollide(t *testing.T) {
+	mcpServer := NewMCPServer("test", "1.0.0")
+	httpServer := NewStreamableHTTPServer(mcpServer,
+		WithHeartbeatInterval(50*time.Millisecond),
+	)
+	ts := httptest.NewServer(httpServer)
+	defer ts.Close()
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			mcpServer := NewMCPServer("test", "1.0.0")
-			httpServer := NewStreamableHTTPServer(mcpServer,
-				WithHeartbeatInterval(50*time.Millisecond),
-			)
-			ts := httptest.NewServer(httpServer)
-			defer ts.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL, nil)
+	require.NoError(t, err)
+	req.Header.Set("Accept", "text/event-stream")
 
-			// Open a GET (SSE) connection with a short-lived context.
-			ctx, cancel := context.WithCancel(t.Context())
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL, nil)
-			require.NoError(t, err)
-			req.Header.Set("Content-Type", "text/event-stream")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
 
-			resp, err := http.DefaultClient.Do(req)
-			require.NoError(t, err)
-
-			countEntries := func() int {
-				n := 0
-				httpServer.sessionRequestIDs.Range(func(_, _ any) bool { n++; return true })
-				return n
-			}
-
-			// Poll until the heartbeat fires and populates sessionRequestIDs.
-			require.Eventually(t, func() bool { return countEntries() > 0 },
-				time.Second, 10*time.Millisecond,
-				"sessionRequestIDs should have an entry while GET is open")
-
-			// Close the connection and poll until the deferred cleanup runs.
-			cancel()
-			resp.Body.Close()
-			assert.Eventually(t, func() bool { return countEntries() == 0 },
-				time.Second, 10*time.Millisecond,
-				"sessionRequestIDs should be empty after GET connection closes")
+	// The GET handler registers the session; grab it and issue an elicitation
+	// that will be written to the same SSE stream as the heartbeat pings.
+	var session *streamableHttpSession
+	require.Eventually(t, func() bool {
+		httpServer.activeSessions.Range(func(_, v any) bool {
+			session, _ = v.(*streamableHttpSession)
+			return false
 		})
+		return session != nil
+	}, time.Second, 10*time.Millisecond)
+
+	elicitationCtx, cancelElicitation := context.WithCancel(t.Context())
+	defer cancelElicitation()
+	go func() {
+		_, _ = session.RequestElicitation(elicitationCtx, mcp.ElicitationRequest{
+			Params: mcp.ElicitationParams{
+				Message:         "id collision probe",
+				RequestedSchema: map[string]any{"type": "object"},
+			},
+		})
+	}()
+
+	// Read SSE events until we have seen a ping and the elicitation request.
+	ids := make(map[int64][]string)
+	scanner := bufio.NewScanner(resp.Body)
+	deadline := time.After(5 * time.Second)
+	var sawPing, sawElicitation bool
+	for !sawPing || !sawElicitation {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for ping and elicitation events")
+		default:
+		}
+		if !scanner.Scan() {
+			t.Fatalf("SSE stream ended early: %v", scanner.Err())
+		}
+		line := scanner.Text()
+		data, ok := strings.CutPrefix(line, "data: ")
+		if !ok {
+			continue
+		}
+		var event struct {
+			ID     *int64 `json:"id"`
+			Method string `json:"method"`
+		}
+		require.NoError(t, json.Unmarshal([]byte(data), &event))
+		if event.ID == nil {
+			continue
+		}
+		switch event.Method {
+		case "ping":
+			sawPing = true
+		case string(mcp.MethodElicitationCreate):
+			sawElicitation = true
+		default:
+			continue
+		}
+		ids[*event.ID] = append(ids[*event.ID], event.Method)
 	}
+
+	for id, methods := range ids {
+		require.Len(t, methods, 1,
+			"request ID %d used by more than one request: %v", id, methods)
+	}
+}
+
+// TestStreamableHTTP_TrySendWaitsForBufferSpace verifies that transient
+// backpressure on an active POST stream makes trySend wait rather than spill
+// the request to the standalone GET stream, that it reports what the POST
+// stream did with the request, and that it gives up when the caller's
+// context ends or the POST stream finishes.
+func TestStreamableHTTP_TrySendWaitsForBufferSpace(t *testing.T) {
+	requests := make(chan scopedRequest, 1)
+	done := make(chan struct{})
+	scoped := &requestScopedSSE{requests: requests, done: done}
+
+	send := func(ctx context.Context) <-chan bool {
+		result := make(chan bool, 1)
+		go func() { result <- scoped.trySend(ctx, mcp.JSONRPCRequest{}) }()
+		return result
+	}
+	pending := func(result <-chan bool, why string) {
+		t.Helper()
+		select {
+		case r := <-result:
+			t.Fatalf("expected trySend to wait (%s), returned %v", why, r)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	returns := func(result <-chan bool) bool {
+		t.Helper()
+		select {
+		case r := <-result:
+			return r
+		case <-time.After(2 * time.Second):
+			t.Fatal("trySend did not return")
+			return false
+		}
+	}
+
+	// A full buffer makes the send wait for space, then for the stream to
+	// settle the request.
+	requests <- scopedRequest{delivered: make(chan bool, 1)}
+	result := send(t.Context())
+	pending(result, "buffer full")
+	<-requests
+	item := <-requests
+	pending(result, "queued, not yet written")
+	item.delivered <- true
+	require.True(t, returns(result), "a written request reports true")
+
+	// A request the stream could not write reports false, so the caller
+	// falls back to the GET stream.
+	result = send(t.Context())
+	item = <-requests
+	item.delivered <- false
+	require.False(t, returns(result), "an unwritten request reports false")
+
+	// An ended context while the request is queued reports true: the
+	// request may still be written, so it must not be sent again.
+	queuedCtx, cancelQueued := context.WithCancel(t.Context())
+	result = send(queuedCtx)
+	item = <-requests
+	cancelQueued()
+	require.True(t, returns(result))
+
+	// An ended context while the buffer is full never queued the request.
+	requests <- item
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	require.False(t, scoped.trySend(cancelled, mcp.JSONRPCRequest{}))
+	<-requests
+
+	// A finished POST stream reports false immediately.
+	close(done)
+	require.False(t, scoped.trySend(t.Context(), mcp.JSONRPCRequest{}))
 }
 
 func TestStreamableHTTP_SamplingResponseErrors(t *testing.T) {
@@ -2983,4 +3379,107 @@ func TestStreamableHTTP_SamplingResponseErrors(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		assert.Contains(t, string(body), "No pending sampling request")
 	})
+}
+
+func TestStreamableHTTP_ShutdownWithActiveConnection(t *testing.T) {
+	mcpServer := NewMCPServer("test", "1.0.0")
+	mux := http.NewServeMux()
+	customServer := &http.Server{Handler: mux}
+	httpServer := NewStreamableHTTPServer(
+		mcpServer,
+		WithStateful(true),
+		WithStreamableHTTPServer(customServer),
+	)
+	mux.Handle(httpServer.endpointPath, httpServer)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- customServer.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		shutdownCtx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+		defer cancel()
+		_ = httpServer.Shutdown(shutdownCtx)
+		select {
+		case err := <-serveDone:
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				t.Logf("Serve returned: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+		}
+	})
+
+	baseURL := "http://" + listener.Addr().String() + httpServer.endpointPath
+
+	ctx := t.Context()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL, nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	sessionCount := 0
+	httpServer.activeSessions.Range(func(_, _ any) bool {
+		sessionCount++
+		return true
+	})
+	require.Greater(t, sessionCount, 0)
+
+	shutdownDone := make(chan error, 1)
+	shutdownCtx, shutdownCancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer shutdownCancel()
+	go func() {
+		shutdownDone <- httpServer.Shutdown(shutdownCtx)
+	}()
+
+	select {
+	case err := <-shutdownDone:
+		if shutdownCtx.Err() == context.DeadlineExceeded {
+			t.Fatalf("Shutdown deadlocked (timed out): %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("Shutdown did not return in time (likely deadlocked)")
+	}
+}
+
+func TestStreamableHTTP_CloseSessions(t *testing.T) {
+	mcpServer := NewMCPServer("test", "1.0.0")
+	httpServer := NewStreamableHTTPServer(mcpServer, WithStateful(true))
+
+	ts := httptest.NewServer(httpServer)
+	defer ts.Close()
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, ts.URL, nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	sessionCount := 0
+	httpServer.activeSessions.Range(func(_, _ any) bool {
+		sessionCount++
+		return true
+	})
+	require.Greater(t, sessionCount, 0)
+
+	httpServer.CloseSessions(t.Context())
+
+	sessionCount = 0
+	httpServer.activeSessions.Range(func(_, _ any) bool {
+		sessionCount++
+		return true
+	})
+	require.Equal(t, 0, sessionCount)
+
+	req2, err := http.NewRequestWithContext(t.Context(), http.MethodGet, ts.URL, nil)
+	require.NoError(t, err)
+	resp2, err := http.DefaultClient.Do(req2)
+	require.NoError(t, err)
+	defer resp2.Body.Close()
+	require.Equal(t, http.StatusOK, resp2.StatusCode)
 }
